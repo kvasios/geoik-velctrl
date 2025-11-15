@@ -10,10 +10,12 @@ import pyrealsense2 as rs
 import socket
 import threading
 import time
+import yaml
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from scipy.spatial.transform import Rotation
 import argparse
+from pathlib import Path
 
 
 @dataclass
@@ -62,10 +64,20 @@ class MarkerTracker:
             'apriltag': cv2.aruco.DICT_APRILTAG_36h11,
         }
         
-        # Setup ArUco detector
+        # Setup ArUco detector with improved parameters for stability
         aruco_dict_enum = dict_map.get(aruco_dict, cv2.aruco.DICT_4X4_50)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_enum)
         self.detector_params = cv2.aruco.DetectorParameters()
+        
+        # Improve detection stability
+        self.detector_params.adaptiveThreshWinSizeMin = 3
+        self.detector_params.adaptiveThreshWinSizeMax = 23
+        self.detector_params.adaptiveThreshWinSizeStep = 10
+        self.detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.detector_params.cornerRefinementWinSize = 5
+        self.detector_params.cornerRefinementMaxIterations = 30
+        self.detector_params.cornerRefinementMinAccuracy = 0.1
+        
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.detector_params)
         
         # Marker/Board configuration
@@ -73,30 +85,51 @@ class MarkerTracker:
         self.marker_size = marker_size  # meters (for single marker)
         
         if use_board:
-            # Create ArUco board
-            self.board = cv2.aruco.GridBoard(
-                (board_cols, board_rows),
-                board_marker_size,
-                board_spacing,
+            # Create ChArUco board (chessboard with ArUco markers)
+            square_length = board_marker_size + board_spacing
+            marker_length = board_marker_size
+            self.charuco_board = cv2.aruco.CharucoBoard(
+                (board_cols, board_rows),  # squaresX, squaresY
+                square_length,
+                marker_length,
                 self.aruco_dict
             )
             self.board_rows = board_rows
             self.board_cols = board_cols
-            marker_type = f"{board_rows}x{board_cols} board"
+            self.square_length = square_length
+            self.marker_length = marker_length
+            marker_type = f"{board_rows}x{board_cols} ChArUco board"
+            print(f"ChArUco board created: {board_cols}x{board_rows} squares, "
+                  f"square={square_length*1000:.2f}mm, marker={marker_length*1000:.2f}mm")
         else:
-            self.board = None
+            self.charuco_board = None
             marker_type = "single marker"
         
         # RealSense pipeline setup
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         
-        # Enable color and depth streams
-        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, camera_fps)
-        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, camera_fps)
+        # Enable color stream only (max resolution for better detection)
+        # Try max resolution first, fallback to lower if not supported
+        resolution_attempts = [
+            (1920, 1080, "1920x1080"),
+            (1280, 720, "1280x720"),
+            (640, 480, "640x480")
+        ]
         
-        # Start pipeline
-        profile = self.pipeline.start(self.config)
+        profile = None
+        for width, height, name in resolution_attempts:
+            try:
+                self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, camera_fps)
+                profile = self.pipeline.start(self.config)
+                print(f"✓ Using {name} resolution")
+                break
+            except RuntimeError:
+                self.config = rs.config()  # Reset config for next attempt
+                continue
+        
+        if profile is None:
+            raise RuntimeError("Failed to start RealSense camera with any supported resolution")
         
         # Get camera intrinsics
         color_profile = profile.get_stream(rs.stream.color)
@@ -109,8 +142,6 @@ class MarkerTracker:
         ])
         self.dist_coeffs = np.array(intrinsics.coeffs)
         
-        # Align depth to color
-        self.align = rs.align(rs.stream.color)
         
         # GUI state
         self.running = True
@@ -126,7 +157,10 @@ class MarkerTracker:
         print(f"Robot: {robot_ip}:{robot_port}")
         print(f"Marker type: {marker_type}")
         if use_board:
-            print(f"Board markers: {board_marker_size*100:.1f}cm, spacing: {board_spacing*100:.1f}cm")
+            print(f"ChArUco board: {board_rows}x{board_cols} squares")
+            print(f"  Square length: {self.square_length*100:.1f}cm")
+            print(f"  Marker length: {self.marker_length*100:.1f}cm")
+            print(f"  Spacing: {board_spacing*100:.1f}cm")
         else:
             print(f"Marker size: {marker_size*100:.1f}cm")
         print(f"ArUco dict: {aruco_dict}")
@@ -137,7 +171,7 @@ class MarkerTracker:
         print("\nWaiting for marker detection...")
     
     def detect_marker(self, color_image: np.ndarray) -> Optional[MarkerPose]:
-        """Detect ArUco marker/board and estimate 6D pose"""
+        """Detect ArUco marker/ChArUco board and estimate 6D pose"""
         gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
         
         # Detect markers
@@ -147,9 +181,27 @@ class MarkerTracker:
             return None
         
         if self.use_board:
-            # Use board pose estimation (more robust with multiple markers)
-            retval, rvec, tvec = cv2.aruco.estimatePoseBoard(
-                corners, ids, self.board, 
+            # ChArUco board detection (more stable than GridBoard)
+            # Step 1: Interpolate chessboard corners from detected markers
+            result = cv2.aruco.interpolateCornersCharuco(
+                corners, ids, gray, self.charuco_board,
+                cameraMatrix=self.camera_matrix,
+                distCoeffs=self.dist_coeffs
+            )
+            
+            # Handle different OpenCV versions (returns 3 or 4 values)
+            if len(result) == 3:
+                num_corners, charuco_corners, charuco_ids = result
+            else:
+                charuco_corners, charuco_ids, _ = result
+                num_corners = len(charuco_corners) if charuco_corners is not None else 0
+            
+            if charuco_corners is None or num_corners < 4:
+                return None  # Need at least 4 corners for pose estimation
+            
+            # Step 2: Estimate pose from chessboard corners (sub-pixel accurate)
+            retval, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
+                charuco_corners, charuco_ids, self.charuco_board,
                 self.camera_matrix, self.dist_coeffs,
                 None, None
             )
@@ -157,7 +209,10 @@ class MarkerTracker:
             if retval == 0:  # No valid pose
                 return None
             
-            num_detected = len(ids)
+            # ChArUco returns tvec/rvec as 1D arrays (3,) not nested
+            tvec = tvec.flatten()
+            rvec = rvec.flatten()
+            num_detected = len(ids)  # Number of ArUco markers detected
             
         else:
             # Single marker pose estimation
@@ -168,8 +223,8 @@ class MarkerTracker:
                 corner, self.marker_size, self.camera_matrix, self.dist_coeffs
             )
             
-            rvec = rvec[0]
-            tvec = tvec[0]
+            rvec = rvec[0].flatten()
+            tvec = tvec[0].flatten()
             num_detected = 1
         
         # Convert rotation vector to quaternion
@@ -177,15 +232,15 @@ class MarkerTracker:
         rotation = Rotation.from_matrix(rotation_matrix)
         quat = rotation.as_quat()  # [qx, qy, qz, qw]
         
-        # Position in camera frame
-        position = tvec[0] if self.use_board else tvec[0]  # [x, y, z] in meters
+        # Position in camera frame (tvec is already 1D array [x, y, z])
+        position = tvec  # [x, y, z] in meters
         
         self.last_detection_time = time.time()
         
         return MarkerPose(
             position=position,
             orientation=quat,
-            tvec=tvec if self.use_board else tvec[0],
+            tvec=tvec,
             rvec=rvec,
             detected=True,
             num_markers=num_detected
@@ -197,7 +252,12 @@ class MarkerTracker:
             return
         
         # Draw axis (X=red, Y=green, Z=blue)
-        axis_length = self.marker_size * 1.5
+        # Use appropriate marker size for axis length
+        if self.use_board:
+            axis_length = self.marker_length * 1.5  # Use marker_length for ChArUco
+        else:
+            axis_length = self.marker_size * 1.5  # Use marker_size for single marker
+        
         axis_points = np.float32([
             [0, 0, 0],
             [axis_length, 0, 0],
@@ -300,7 +360,7 @@ class MarkerTracker:
         # Detection status
         if self.current_marker_pose is not None and self.current_marker_pose.detected:
             if self.use_board:
-                status_text = f"Board detected ({self.current_marker_pose.num_markers} markers) - Press 't'"
+                status_text = f"ChArUco board detected ({self.current_marker_pose.num_markers} markers) - Press 't'"
             else:
                 status_text = "Marker detected - Press 't' to track"
             status_color = (0, 255, 0)
@@ -312,7 +372,7 @@ class MarkerTracker:
                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         else:
             if self.use_board:
-                status_text = "No board detected"
+                status_text = "No ChArUco board detected"
             else:
                 status_text = "No marker detected"
             status_color = (0, 0, 255)
@@ -347,11 +407,10 @@ class MarkerTracker:
         
         try:
             while self.running:
-                # Get frames
+                # Get color frame directly (no depth needed)
                 frames = self.pipeline.wait_for_frames()
-                aligned_frames = self.align.process(frames)
+                color_frame = frames.get_color_frame()
                 
-                color_frame = aligned_frames.get_color_frame()
                 if not color_frame:
                     continue
                 
@@ -394,8 +453,137 @@ class MarkerTracker:
         print("Cleanup complete")
 
 
+def load_marker_config(config_path: str) -> Dict:
+    """Load marker configuration from YAML file"""
+    config_file = Path(config_path)
+    
+    if not config_file.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    aruco_dict = config.get('aruco_dict', '4x4_50')
+    measured_marker_size = config.get('measured_marker_size')
+    
+    # Determine if single marker or ChArUco board
+    if 'squares_x' in config or 'squares_y' in config:
+        # ChArUco board configuration
+        squares_x = config.get('squares_x', config.get('board_cols', 3))
+        squares_y = config.get('squares_y', config.get('board_rows', 3))
+        
+        measured_square_size = config.get('measured_square_size')
+        
+        # Prefer square measurement if provided (more accurate), otherwise use marker measurement
+        if measured_square_size is not None:
+            print("✓ Using measured square size (most accurate)")
+            
+            # Direct measurement - no scaling needed
+            scaled_square_length = measured_square_size
+            original_marker_length = config.get('_original_marker_length_meters')
+            original_square_length = config.get('_original_square_length_meters')
+            
+            if original_marker_length and original_square_length:
+                # Calculate marker size from square size (maintain original ratio)
+                ratio = original_marker_length / original_square_length
+                scaled_marker_length = scaled_square_length * ratio
+                scaled_spacing = scaled_square_length - scaled_marker_length
+            else:
+                # Fallback: assume marker scales with square
+                if measured_marker_size is not None:
+                    scaled_marker_length = measured_marker_size
+                    scaled_spacing = scaled_square_length - scaled_marker_length
+                else:
+                    raise ValueError("Need either measured_marker_size or original reference values")
+            
+            # Calculate total board dimensions
+            total_width = squares_x * scaled_square_length
+            total_height = squares_y * scaled_square_length
+            
+            print(f"  Measured square: {measured_square_size*1000:.2f}mm")
+            print(f"  Calculated marker: {scaled_marker_length*1000:.2f}mm")
+            print(f"  Calculated spacing: {scaled_spacing*1000:.2f}mm")
+            print(f"  Calculated board size: {total_width*100:.1f}cm × {total_height*100:.1f}cm")
+            
+        elif measured_marker_size is not None:
+            print("✓ Using measured marker size - inferring square size (assumes uniform scaling)")
+            
+            # Get original reference values (for calculating scale factor)
+            original_marker_length = config.get('_original_marker_length_meters')
+            original_square_length = config.get('_original_square_length_meters')
+            
+            if original_marker_length and original_square_length:
+                # Calculate scale factor from measured vs expected marker size
+                scale_factor = measured_marker_size / original_marker_length
+                
+                # Scale square length proportionally (assumes uniform printing scale)
+                scaled_square_length = original_square_length * scale_factor
+                scaled_marker_length = measured_marker_size
+                scaled_spacing = scaled_square_length - scaled_marker_length
+                
+                # Calculate total board dimensions
+                total_width = squares_x * scaled_square_length
+                total_height = squares_y * scaled_square_length
+                
+                print(f"  Measured marker: {measured_marker_size*1000:.2f}mm")
+                print(f"  Inferred square length: {scaled_square_length*1000:.2f}mm")
+                print(f"  Inferred spacing: {scaled_spacing*1000:.2f}mm")
+                print(f"  Calculated board size: {total_width*100:.1f}cm × {total_height*100:.1f}cm")
+                print(f"  ⚠ Note: For best accuracy, measure square size directly")
+            else:
+                raise ValueError("Missing original reference values in config file. Please regenerate the marker.")
+        else:
+            raise ValueError(
+                "Please measure EITHER:\n"
+                "  - 'measured_marker_size' (easier, assumes uniform scaling)\n"
+                "  - 'measured_square_size' (more accurate, recommended)\n"
+                "Example: If marker measures 4.5cm, set: measured_marker_size: 0.045\n"
+                "        If square measures 5.1cm, set: measured_square_size: 0.051"
+            )
+        
+        # Return detection config for ChArUco
+        return {
+            'aruco_dict': aruco_dict,
+            'use_board': True,
+            'board_rows': squares_y,  # squares_y maps to rows
+            'board_cols': squares_x,  # squares_x maps to cols
+            'board_marker_size_meters': scaled_marker_length,
+            'board_spacing_meters': scaled_spacing,
+        }
+    
+    else:
+        # Single marker configuration
+        if measured_marker_size is not None:
+            print("✓ Using measured marker size from config file")
+            return {
+                'aruco_dict': aruco_dict,
+                'use_board': False,
+                'marker_size_meters': measured_marker_size,
+            }
+        else:
+            raise ValueError(
+                "Please measure the marker side and fill in 'measured_marker_size' in the YAML file (in meters).\n"
+                "Example: If marker measures 5.0cm, set: measured_marker_size: 0.05"
+            )
+
+
 def main():
-    parser = argparse.ArgumentParser(description='ArUco Marker Tracking for Robot Control')
+    parser = argparse.ArgumentParser(
+        description='ArUco Marker Tracking for Robot Control',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Use YAML config file (recommended)
+  python3 marker_track.py --config markers/board_4x4_4x4_50.yaml
+
+  # Use command-line arguments
+  python3 marker_track.py --board --board-rows 4 --board-cols 4 --board-marker-size 0.04
+        """
+    )
+    
+    # Config file (takes precedence)
+    parser.add_argument('--config', type=str,
+                       help='Path to YAML config file (overrides other marker args)')
     
     # Network parameters
     parser.add_argument('--robot-ip', type=str, default='192.168.18.1',
@@ -403,18 +591,18 @@ def main():
     parser.add_argument('--robot-port', type=int, default=8888,
                        help='Robot UDP port (default: 8888)')
     
-    # Marker/Board selection
+    # Marker/Board selection (ignored if --config is used)
     marker_group = parser.add_mutually_exclusive_group()
     marker_group.add_argument('--single', action='store_true',
-                             help='Use single marker (default)')
+                             help='Use single marker (default if no config)')
     marker_group.add_argument('--board', action='store_true',
                              help='Use marker board (more robust)')
     
-    # Single marker parameters
+    # Single marker parameters (ignored if --config is used)
     parser.add_argument('--marker-size', type=float, default=0.05,
                        help='Single marker size in meters (default: 0.05)')
     
-    # Board parameters
+    # Board parameters (ignored if --config is used)
     parser.add_argument('--board-rows', type=int, default=4,
                        help='Board rows (default: 4)')
     parser.add_argument('--board-cols', type=int, default=4,
@@ -424,7 +612,7 @@ def main():
     parser.add_argument('--board-spacing', type=float, default=0.01,
                        help='Board marker spacing in meters (default: 0.01)')
     
-    # ArUco dictionary
+    # ArUco dictionary (ignored if --config is used)
     parser.add_argument('--dict', type=str, default='4x4_50',
                        choices=['4x4_50', '5x5_100', '6x6_250', 'apriltag'],
                        help='ArUco dictionary (default: 4x4_50)')
@@ -435,17 +623,70 @@ def main():
     
     args = parser.parse_args()
     
+    # Auto-detect YAML config if not provided
+    if not args.config:
+        markers_dir = Path('markers')
+        if markers_dir.exists():
+            yaml_files = list(markers_dir.glob('*.yaml'))
+            if yaml_files:
+                # Use the most recently modified YAML file
+                latest_yaml = max(yaml_files, key=lambda p: p.stat().st_mtime)
+                args.config = str(latest_yaml)
+                print(f"Auto-detected config: {args.config}")
+    
+    # Load config from YAML if provided
+    if args.config:
+        try:
+            config = load_marker_config(args.config)
+            
+            # Extract parameters from config
+            use_board = config.get('use_board', False)
+            aruco_dict = config.get('aruco_dict', '4x4_50')
+            
+            if use_board:
+                marker_size = None  # Not used for boards
+                board_rows = config.get('board_rows', 4)
+                board_cols = config.get('board_cols', 4)
+                board_marker_size = config.get('board_marker_size_meters', 0.04)
+                board_spacing = config.get('board_spacing_meters', 0.01)
+            else:
+                marker_size = config.get('marker_size_meters', 0.05)
+                board_rows = None
+                board_cols = None
+                board_marker_size = None
+                board_spacing = None
+            
+        except Exception as e:
+            print(f"Error loading config file: {e}")
+            print("Falling back to command-line arguments...")
+            use_board = args.board
+            marker_size = args.marker_size
+            board_rows = args.board_rows
+            board_cols = args.board_cols
+            board_marker_size = args.board_marker_size
+            board_spacing = args.board_spacing
+            aruco_dict = args.dict
+    else:
+        # Use command-line arguments
+        use_board = args.board
+        marker_size = args.marker_size
+        board_rows = args.board_rows
+        board_cols = args.board_cols
+        board_marker_size = args.board_marker_size
+        board_spacing = args.board_spacing
+        aruco_dict = args.dict
+    
     try:
         tracker = MarkerTracker(
             robot_ip=args.robot_ip,
             robot_port=args.robot_port,
-            marker_size=args.marker_size,
-            use_board=args.board,
-            board_rows=args.board_rows,
-            board_cols=args.board_cols,
-            board_marker_size=args.board_marker_size,
-            board_spacing=args.board_spacing,
-            aruco_dict=args.dict,
+            marker_size=marker_size if not use_board else 0.05,  # Dummy value for boards
+            use_board=use_board,
+            board_rows=board_rows if use_board else 4,
+            board_cols=board_cols if use_board else 4,
+            board_marker_size=board_marker_size if use_board else 0.04,
+            board_spacing=board_spacing if use_board else 0.01,
+            aruco_dict=aruco_dict,
             camera_fps=args.fps
         )
         tracker.run()

@@ -7,6 +7,7 @@ Creates both single markers and boards with printable PDFs
 import cv2
 import numpy as np
 import argparse
+import yaml
 from pathlib import Path
 
 
@@ -32,32 +33,71 @@ def generate_single_marker(marker_id: int, marker_size: int, dict_type: int, out
 
 def generate_board(rows: int, cols: int, marker_size_px: int, marker_separation_px: int,
                    dict_type: int, first_marker_id: int, output_path: str):
-    """Generate an ArUco board (grid of markers)"""
+    """Generate a ChArUco board (chessboard with ArUco markers)"""
     aruco_dict = cv2.aruco.getPredefinedDictionary(dict_type)
     
-    # Create board
-    board = cv2.aruco.GridBoard(
-        (cols, rows),
-        float(marker_size_px),
-        float(marker_separation_px),
+    # ChArUco board: squaresX and squaresY define the chessboard grid
+    # squareLength = marker_size + spacing (total square size)
+    # markerLength = marker_size (ArUco marker inside square)
+    square_length_px = float(marker_size_px + marker_separation_px)
+    marker_length_px = float(marker_size_px)
+    
+    # Create ChArUco board
+    # Note: squaresX/squaresY are the number of squares, not markers
+    # For a 3x3 marker grid, we need 4x4 squares (squares = markers + 1)
+    charuco_board = cv2.aruco.CharucoBoard(
+        (cols, rows),  # squaresX, squaresY (number of squares)
+        square_length_px,
+        marker_length_px,
         aruco_dict
     )
     
     # Calculate board image size
-    board_width = cols * marker_size_px + (cols - 1) * marker_separation_px
-    board_height = rows * marker_size_px + (rows - 1) * marker_separation_px
+    # ChArUco: (squaresX * squareLength) x (squaresY * squareLength)
+    board_width = int(cols * square_length_px)
+    board_height = int(rows * square_length_px)
     
     # Add border (20% of average dimension)
     border_size = int((board_width + board_height) / 2 * 0.2)
     
     # Generate board image
-    board_image = board.generateImage((board_width, board_height), marginSize=border_size)
+    board_image = charuco_board.generateImage((board_width, board_height), marginSize=border_size)
     
     # Save image
     cv2.imwrite(output_path, board_image)
-    print(f"✓ Generated {rows}x{cols} board: {output_path}")
+    print(f"✓ Generated ChArUco board ({rows}x{cols} squares): {output_path}")
     print(f"  Image size: {board_image.shape[1]}x{board_image.shape[0]} pixels")
-    print(f"  Marker IDs: {first_marker_id} to {first_marker_id + rows*cols - 1}")
+    print(f"  Square size: {square_length_px:.1f}px, Marker size: {marker_length_px:.1f}px")
+
+
+def generate_marker_config(output_path: str, marker_type: str, config: dict):
+    """Generate YAML configuration file for marker detection"""
+    # Minimal config - only what we know for sure + one measurement field
+    config_data = {
+        'aruco_dict': config.get('aruco_dict', '4x4_50'),
+    }
+    
+    if marker_type == 'single':
+        config_data['measured_marker_size'] = None  # User fills this in meters
+    elif marker_type == 'board':
+        # ChArUco board parameters
+        config_data['squares_x'] = config['board_cols']  # squaresX
+        config_data['squares_y'] = config['board_rows']  # squaresY
+        # Store original values as reference (for calculating scale factor)
+        config_data['_original_square_length_meters'] = config['board_marker_size_meters'] + config['board_spacing_meters']
+        config_data['_original_marker_length_meters'] = config['board_marker_size_meters']
+        # User can measure either marker OR square (square is more accurate but harder to measure)
+        config_data['measured_marker_size'] = None  # Option 1: Measure one marker side (easier, assumes uniform scaling)
+        config_data['measured_square_size'] = None  # Option 2: Measure one square side (more accurate, optional)
+    
+    # Write YAML file
+    yaml_path = output_path.with_suffix('.yaml')
+    with open(yaml_path, 'w') as f:
+        yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+    
+    print(f"✓ Generated config file: {yaml_path}")
+    print(f"  ⚠ After printing, measure ONE marker side and fill in 'measured_marker_size' (in meters)")
+    return yaml_path
 
 
 def create_printable_pdf(image_path: str, physical_size_cm: float, output_pdf: str):
@@ -113,14 +153,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Generate default board (4x4, 20cm, 0.6cm spacing)
+  python3 generate_marker.py
+
   # Generate single marker (5cm)
   python3 generate_marker.py --single --id 0 --size 5.0
 
-  # Generate 4x4 board (20cm total)
-  python3 generate_marker.py --board --rows 4 --cols 4 --board-size 20.0
-
-  # Generate board with custom marker size
-  python3 generate_marker.py --board --rows 3 --cols 3 --marker-size 4.0 --spacing 1.0
+  # Generate custom board
+  python3 generate_marker.py --rows 3 --cols 3 --board-size 16.0 --spacing 0.6
 
 Dictionary types:
   4x4_50    - 50 markers, 4x4 bits (default, good for small markers)
@@ -129,12 +169,12 @@ Dictionary types:
         """
     )
     
-    # Marker type
-    marker_group = parser.add_mutually_exclusive_group(required=True)
+    # Marker type (defaults to board if not specified)
+    marker_group = parser.add_mutually_exclusive_group(required=False)
     marker_group.add_argument('--single', action='store_true',
                              help='Generate single marker')
     marker_group.add_argument('--board', action='store_true',
-                             help='Generate marker board')
+                             help='Generate marker board (default)')
     
     # Common parameters
     parser.add_argument('--dict', type=str, default='4x4_50',
@@ -156,14 +196,18 @@ Dictionary types:
                        help='Board rows (default: 4)')
     parser.add_argument('--cols', type=int, default=4,
                        help='Board columns (default: 4)')
-    parser.add_argument('--board-size', type=float,
-                       help='Total board physical size in cm (calculates marker size automatically)')
+    parser.add_argument('--board-size', type=float, default=20.0,
+                       help='Total board physical size in cm (calculates marker size automatically, default: 20.0)')
     parser.add_argument('--marker-size', type=float, default=4.0,
-                       help='Individual marker size in cm (default: 4.0)')
-    parser.add_argument('--spacing', type=float, default=1.0,
-                       help='Marker spacing in cm (default: 1.0)')
+                       help='Individual marker size in cm (default: 4.0, ignored if --board-size is set)')
+    parser.add_argument('--spacing', type=float, default=0.6,
+                       help='Marker spacing in cm (default: 0.6)')
     
     args = parser.parse_args()
+    
+    # Default to board if neither --single nor --board specified
+    if not args.single and not args.board:
+        args.board = True
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -199,6 +243,15 @@ Dictionary types:
         pdf_path = output_path.with_suffix('.pdf')
         create_printable_pdf(str(output_path), args.size, str(pdf_path))
         
+        # Generate YAML config
+        config = {
+            'aruco_dict': args.dict,
+            'marker_id': args.id,
+            'marker_size_meters': args.size / 100.0,  # Convert cm to meters
+            'marker_size_cm': args.size,
+        }
+        generate_marker_config(output_path, 'single', config)
+        
     else:
         # Generate board
         if args.board_size:
@@ -226,15 +279,43 @@ Dictionary types:
         # Generate PDF
         pdf_path = output_path.with_suffix('.pdf')
         create_printable_pdf(str(output_path), total_width, str(pdf_path))
+        
+        # Generate YAML config
+        config = {
+            'aruco_dict': args.dict,
+            'board_rows': args.rows,
+            'board_cols': args.cols,
+            'board_marker_size_meters': marker_size_cm / 100.0,  # Convert cm to meters
+            'board_spacing_meters': spacing_cm / 100.0,
+            'board_marker_size_cm': marker_size_cm,
+            'board_spacing_cm': spacing_cm,
+            'total_width_cm': total_width,
+            'total_height_cm': total_height,
+        }
+        generate_marker_config(output_path, 'board', config)
     
     print(f"\n{'='*60}")
     print(f"✓ Generation complete!")
     print(f"{'='*60}")
     print(f"\nNext steps:")
     print(f"1. Print the PDF at 100% scale (no 'fit to page')")
-    print(f"2. Verify physical dimensions with a ruler")
-    print(f"3. Mount on flat, rigid surface")
-    print(f"4. Run marker tracker with matching --marker-size parameter")
+    print(f"2. Measure with a ruler:")
+    if args.single:
+        print(f"   - Measure ONE marker side dimension")
+    else:
+        print(f"   - Option A (easier): Measure ONE marker side")
+        print(f"   - Option B (more accurate): Measure ONE square side (recommended)")
+    print(f"3. Edit the YAML config file (*.yaml):")
+    if args.single:
+        print(f"   - Fill in 'measured_marker_size' (in meters)")
+        print(f"   - Example: If marker measures 5.0cm, enter: 0.05")
+    else:
+        print(f"   - Fill in EITHER 'measured_marker_size' OR 'measured_square_size' (in meters)")
+        print(f"   - Example: If marker measures 4.5cm, enter: measured_marker_size: 0.045")
+        print(f"   - Example: If square measures 5.1cm, enter: measured_square_size: 0.051")
+        print(f"   - All other dimensions will be calculated automatically!")
+    print(f"4. Mount marker/board on flat, rigid surface")
+    print(f"5. Run marker tracker with: --config <path_to_yaml_file>")
     print()
 
 

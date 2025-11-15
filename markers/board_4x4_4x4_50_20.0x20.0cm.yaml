@@ -1,0 +1,7 @@
+aruco_dict: 4x4_50
+squares_x: 4
+squares_y: 4
+_original_square_length_meters: 0.0515
+_original_marker_length_meters: 0.0455
+measured_marker_size: 0.0245
+measured_square_size: null

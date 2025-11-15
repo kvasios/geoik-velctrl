@@ -1,6 +1,7 @@
-// VR-Based Cartesian Teleoperation
+// Geometric IK-based Velocity Control Server for Franka Robot
+// Adapted from franka-vr-teleop (https://github.com/wengmister/franka-vr-teleop)
 // Copyright (c) 2023 Franka Robotics GmbH
-// Use of this source code is governed by the Apache-2.0 license, see LICENSE
+// Use of this source code is governed by the Apache-2.0 license, see LICENSE-APACHE-2.0 and LICENSE-FRANKA-VR-TELEOP
 #include <cmath>
 #include <iostream>
 #include <thread>
@@ -22,27 +23,27 @@
 #include "weighted_ik.h"
 #include <ruckig/ruckig.hpp>
 
-struct VRCommand
+struct PoseCommand
 {
     double pos_x = 0.0, pos_y = 0.0, pos_z = 0.0;
     double quat_x = 0.0, quat_y = 0.0, quat_z = 0.0, quat_w = 1.0;
     bool has_valid_data = false;
 };
 
-class VRController
+class VelocityServer
 {
 private:
     std::atomic<bool> running_{true};
-    VRCommand current_vr_command_;
+    PoseCommand current_pose_command_;
     std::mutex command_mutex_;
 
     int server_socket_;
     const int PORT = 8888;
 
-    // VR mapping parameters
-    struct VRParams
+    // Control parameters
+    struct ControlParams
     {
-        double vr_smoothing = 0.05;       // Less for more responsive control
+        double smoothing = 0.05;       // Less for more responsive control
 
         // Deadzones to prevent drift from small sensor noise
         double position_deadzone = 0.001;   // 1mm
@@ -52,19 +53,19 @@ private:
         double max_position_offset = 0.75;   // 75cm from initial position
     } params_;
 
-    // VR Target Pose
-    Eigen::Vector3d vr_target_position_;
-    Eigen::Quaterniond vr_target_orientation_;
+    // Target Pose (in robot base frame)
+    Eigen::Vector3d target_position_;
+    Eigen::Quaterniond target_orientation_;
 
-    // VR filtering state
-    Eigen::Vector3d filtered_vr_position_{0, 0, 0};
-    Eigen::Quaterniond filtered_vr_orientation_{1, 0, 0, 0};
+    // Filtering state for smooth control
+    Eigen::Vector3d filtered_position_{0, 0, 0};
+    Eigen::Quaterniond filtered_orientation_{1, 0, 0, 0};
 
     // Initial poses used as a reference frame
     Eigen::Affine3d initial_robot_pose_;
-    Eigen::Vector3d initial_vr_position_{0, 0, 0};
-    Eigen::Quaterniond initial_vr_orientation_{1, 0, 0, 0};
-    bool vr_initialized_ = false;
+    Eigen::Vector3d initial_command_position_{0, 0, 0};
+    Eigen::Quaterniond initial_command_orientation_{1, 0, 0, 0};
+    bool initialized_ = false;
 
     // Joint space tracking
     std::array<double, 7> current_joint_angles_;
@@ -96,13 +97,13 @@ private:
     static constexpr double CONTROL_CYCLE_TIME = 0.001;  // 1 kHz
 
 public:
-    VRController(bool bidexhand = true)
+    VelocityServer(bool bidexhand = true)
         : Q7_MIN(bidexhand ? -0.2 : -2.89), Q7_MAX(bidexhand ? 1.9 : 2.89), bidexhand_(bidexhand)
     {
         setupNetworking();
     }
 
-    ~VRController()
+    ~VelocityServer()
     {
         running_ = false;
         close(server_socket_);
@@ -129,7 +130,7 @@ public:
         int flags = fcntl(server_socket_, F_GETFL, 0);
         fcntl(server_socket_, F_SETFL, flags | O_NONBLOCK);
 
-        std::cout << "UDP server listening on port " << PORT << " for VR pose data" << std::endl;
+        std::cout << "UDP server listening on port " << PORT << " for end-effector pose commands" << std::endl;
     }
 
     void networkThread()
@@ -147,7 +148,7 @@ public:
             {
                 buffer[bytes_received] = '\0';
 
-                VRCommand cmd;
+                PoseCommand cmd;
                 int parsed_count = sscanf(buffer, "%lf %lf %lf %lf %lf %lf %lf",
                                           &cmd.pos_x, &cmd.pos_y, &cmd.pos_z,
                                           &cmd.quat_x, &cmd.quat_y, &cmd.quat_z, &cmd.quat_w);
@@ -157,18 +158,18 @@ public:
                     cmd.has_valid_data = true;
 
                     std::lock_guard<std::mutex> lock(command_mutex_);
-                    current_vr_command_ = cmd;
+                    current_pose_command_ = cmd;
 
-                    if (!vr_initialized_)
+                    if (!initialized_)
                     {
-                        initial_vr_position_ = Eigen::Vector3d(cmd.pos_x, cmd.pos_y, cmd.pos_z);
-                        initial_vr_orientation_ = Eigen::Quaterniond(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z).normalized();
+                        initial_command_position_ = Eigen::Vector3d(cmd.pos_x, cmd.pos_y, cmd.pos_z);
+                        initial_command_orientation_ = Eigen::Quaterniond(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z).normalized();
 
-                        filtered_vr_position_ = initial_vr_position_;
-                        filtered_vr_orientation_ = initial_vr_orientation_;
+                        filtered_position_ = initial_command_position_;
+                        filtered_orientation_ = initial_command_orientation_;
 
-                        vr_initialized_ = true;
-                        std::cout << "VR reference pose initialized!" << std::endl;
+                        initialized_ = true;
+                        std::cout << "Initial pose command received and processed!" << std::endl;
                     }
                 }
             }
@@ -178,49 +179,49 @@ public:
     }
 
 private:
-    // This function's only job is to calculate the desired target pose from VR data.
-    void updateVRTargets(const VRCommand &cmd)
+    // Calculate the desired target pose from incoming pose commands
+    void updateTargetPose(const PoseCommand &cmd)
     {
-        if (!cmd.has_valid_data || !vr_initialized_)
+        if (!cmd.has_valid_data || !initialized_)
         {
             return;
         }
 
-        // Current VR pose
-        Eigen::Vector3d vr_pos(cmd.pos_x, cmd.pos_y, cmd.pos_z);
-        Eigen::Quaterniond vr_quat(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z);
-        vr_quat.normalize();
+        // Current commanded pose
+        Eigen::Vector3d cmd_pos(cmd.pos_x, cmd.pos_y, cmd.pos_z);
+        Eigen::Quaterniond cmd_quat(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z);
+        cmd_quat.normalize();
 
-        // Smooth incoming VR data to reduce jitter
-        double alpha = 1.0 - params_.vr_smoothing;
-        filtered_vr_position_ = params_.vr_smoothing * filtered_vr_position_ + alpha * vr_pos;
-        filtered_vr_orientation_ = filtered_vr_orientation_.slerp(alpha, vr_quat);
+        // Smooth incoming data to reduce jitter
+        double alpha = 1.0 - params_.smoothing;
+        filtered_position_ = params_.smoothing * filtered_position_ + alpha * cmd_pos;
+        filtered_orientation_ = filtered_orientation_.slerp(alpha, cmd_quat);
 
-        // Calculate deltas from the initial VR pose
-        Eigen::Vector3d vr_pos_delta = filtered_vr_position_ - initial_vr_position_;
-        Eigen::Quaterniond vr_quat_delta = filtered_vr_orientation_ * initial_vr_orientation_.inverse();
+        // Calculate deltas from the initial commanded pose
+        Eigen::Vector3d pos_delta = filtered_position_ - initial_command_position_;
+        Eigen::Quaterniond quat_delta = filtered_orientation_ * initial_command_orientation_.inverse();
 
         // Apply deadzones to prevent drift
-        if (vr_pos_delta.norm() < params_.position_deadzone)
+        if (pos_delta.norm() < params_.position_deadzone)
         {
-            vr_pos_delta.setZero();
+            pos_delta.setZero();
         }
-        double rotation_angle = 2.0 * acos(std::abs(vr_quat_delta.w()));
+        double rotation_angle = 2.0 * acos(std::abs(quat_delta.w()));
         if (rotation_angle < params_.orientation_deadzone)
         {
-            vr_quat_delta.setIdentity();
+            quat_delta.setIdentity();
         }
 
         // Apply workspace limits
-        if (vr_pos_delta.norm() > params_.max_position_offset)
+        if (pos_delta.norm() > params_.max_position_offset)
         {
-            vr_pos_delta = vr_pos_delta.normalized() * params_.max_position_offset;
+            pos_delta = pos_delta.normalized() * params_.max_position_offset;
         }
 
-        // The final calculation just updates the vr_target_
-        vr_target_position_ = initial_robot_pose_.translation() + vr_pos_delta;
-        vr_target_orientation_ = vr_quat_delta * Eigen::Quaterniond(initial_robot_pose_.rotation());
-        vr_target_orientation_.normalize();
+        // The final calculation updates the target pose
+        target_position_ = initial_robot_pose_.translation() + pos_delta;
+        target_orientation_ = quat_delta * Eigen::Quaterniond(initial_robot_pose_.rotation());
+        target_orientation_.normalize();
     }
 
     // Helper function to clamp q7 within limits
@@ -319,22 +320,22 @@ public:
             
             std::cout << "Ruckig trajectory generator configured with 7 DOFs" << std::endl;
 
-            // Initialize VR targets to the robot's starting pose
-            vr_target_position_ = initial_robot_pose_.translation();
-            vr_target_orientation_ = Eigen::Quaterniond(initial_robot_pose_.rotation());
+            // Initialize target pose to the robot's starting pose
+            target_position_ = initial_robot_pose_.translation();
+            target_orientation_ = Eigen::Quaterniond(initial_robot_pose_.rotation());
 
-            std::thread network_thread(&VRController::networkThread, this);
+            std::thread network_thread(&VelocityServer::networkThread, this);
 
-            std::cout << "Waiting for VR data..." << std::endl;
-            while (!vr_initialized_ && running_)
+            std::cout << "Waiting for pose commands..." << std::endl;
+            while (!initialized_ && running_)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
-            if (vr_initialized_)
+            if (initialized_)
             {
-                std::cout << "VR initialized! Starting real-time control." << std::endl;
-                this->runVRControl(robot);
+                std::cout << "Server initialized! Starting real-time velocity control." << std::endl;
+                this->runControl(robot);
             }
 
             running_ = false;
@@ -349,19 +350,19 @@ public:
     }
 
 private:
-    void runVRControl(franka::Robot &robot)
+    void runControl(franka::Robot &robot)
     {
-        auto vr_control_callback = [this](
+        auto control_callback = [this](
                                        const franka::RobotState &robot_state,
                                        franka::Duration period) -> franka::JointVelocities
         {
-            // Update VR targets from latest command (~50Hz)
-            VRCommand cmd;
+            // Update target pose from latest command
+            PoseCommand cmd;
             {
                 std::lock_guard<std::mutex> lock(command_mutex_);
-                cmd = current_vr_command_;
+                cmd = current_pose_command_;
             }
-            updateVRTargets(cmd);
+            updateTargetPose(cmd);
 
             // Initialize Ruckig with actual robot state on first call
             if (!ruckig_initialized_) {
@@ -392,9 +393,9 @@ private:
             double elapsed_sec = std::chrono::duration<double>(current_time - control_start_time_).count();
             double activation_factor = std::min(1.0, elapsed_sec / ACTIVATION_TIME_SEC);
             
-            // Solve IK for VR target pose to get target joint angles
-            std::array<double, 3> target_pos = eigenToArray3(vr_target_position_);
-            std::array<double, 9> target_rot = quaternionToRotationArray(vr_target_orientation_);
+            // Solve IK for target pose to get target joint angles
+            std::array<double, 3> target_pos = eigenToArray3(target_position_);
+            std::array<double, 9> target_rot = quaternionToRotationArray(target_orientation_);
             
             // Calculate q7 search range around current value
             double current_q7 = current_joint_angles_[6];
@@ -474,11 +475,11 @@ private:
 
         try
         {
-            robot.control(vr_control_callback);
+            robot.control(control_callback);
         }
         catch (const franka::ControlException &e)
         {
-            std::cerr << "VR control exception: " << e.what() << std::endl;
+            std::cerr << "Control exception: " << e.what() << std::endl;
         }
     }
 };
@@ -501,9 +502,9 @@ int main(int argc, char **argv)
 
     try
     {
-        VRController controller(bidexhand);
+        VelocityServer server(bidexhand);
         // Add a signal handler to gracefully shut down on Ctrl+C
-        controller.run(argv[1]);
+        server.run(argv[1]);
     }
     catch (const std::exception &e)
     {

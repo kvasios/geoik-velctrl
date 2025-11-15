@@ -51,8 +51,16 @@ class MarkerTracker:
         
         # Tracking state
         self.tracking_active = False
-        self.marker_locked_pose: Optional[MarkerPose] = None
+        self.marker_locked_pose: Optional[MarkerPose] = None  # "Zero" reference when 't' was pressed
         self.current_marker_pose: Optional[MarkerPose] = None
+        self.robot_base_pose = {
+            'position': np.array([0.0, 0.0, 0.0]),  # Robot base reference (identity)
+            'orientation': np.array([0.0, 0.0, 0.0, 1.0])
+        }
+        self.target_tcp_pose = {
+            'position': np.array([0.0, 0.0, 0.0]),
+            'orientation': np.array([0.0, 0.0, 0.0, 1.0])
+        }
         self.last_detection_time = 0.0
         self.detection_timeout = 0.5  # seconds
         
@@ -112,7 +120,6 @@ class MarkerTracker:
         # Enable color stream only (max resolution for better detection)
         # Try max resolution first, fallback to lower if not supported
         resolution_attempts = [
-            (1920, 1080, "1920x1080"),
             (1280, 720, "1280x720"),
             (640, 480, "640x480")
         ]
@@ -280,16 +287,44 @@ class MarkerTracker:
         cv2.line(image, origin, tuple(imgpts[3].ravel()), (255, 0, 0), 3)  # Z-axis (blue)
     
     def start_tracking(self):
-        """Lock marker pose and start tracking"""
+        """Lock marker pose and start tracking (differential control like VR)"""
         if self.current_marker_pose is not None and self.current_marker_pose.detected:
+            # Lock the current marker pose as "zero" reference
             self.marker_locked_pose = self.current_marker_pose
+            
+            # Initialize target to robot base (identity)
+            self.target_tcp_pose['position'] = self.robot_base_pose['position'].copy()
+            self.target_tcp_pose['orientation'] = self.robot_base_pose['orientation'].copy()
+            
             self.tracking_active = True
-            print(f"\n✓ Tracking started at pose: {self.marker_locked_pose.position}")
-            print(f"  Position: [{self.marker_locked_pose.position[0]:.3f}, "
-                  f"{self.marker_locked_pose.position[1]:.3f}, "
-                  f"{self.marker_locked_pose.position[2]:.3f}]")
+            print(f"\n✓ Tracking started - marker locked as reference!")
+            print(f"  Marker will move robot differentially (like VR controller)")
         else:
             print("\n✗ Cannot start tracking - no marker detected!")
+    
+    def compute_visual_servoing_command(self):
+        """
+        Differential control: marker motion = TCP motion (like VR controller).
+        Exactly the same logic as vr_to_robot_converter.py
+        """
+        if not self.tracking_active or self.marker_locked_pose is None or self.current_marker_pose is None:
+            return
+        
+        # Calculate marker pose delta from locked pose (like VR delta from initial)
+        marker_pos_delta = self.current_marker_pose.position - self.marker_locked_pose.position
+        
+        # Calculate relative rotation (like VR)
+        locked_rot = Rotation.from_quat(self.marker_locked_pose.orientation)
+        current_rot = Rotation.from_quat(self.current_marker_pose.orientation)
+        relative_rot = current_rot * locked_rot.inv()
+        
+        # Apply delta to robot base pose (exactly like VR code)
+        self.target_tcp_pose['position'] = self.robot_base_pose['position'] + marker_pos_delta
+        
+        # Apply relative rotation to base orientation
+        base_rot = Rotation.from_quat(self.robot_base_pose['orientation'])
+        target_rot = relative_rot * base_rot
+        self.target_tcp_pose['orientation'] = target_rot.as_quat()
     
     def stop_tracking(self, reason: str = "User stopped"):
         """Stop tracking"""
@@ -314,11 +349,14 @@ class MarkerTracker:
         dt = 1.0 / rate
         
         while self.running:
-            if self.tracking_active and self.marker_locked_pose is not None:
-                # Send locked pose to robot
+            if self.tracking_active:
+                # Compute visual servoing command to maintain marker pose
+                self.compute_visual_servoing_command()
+                
+                # Send target TCP pose to robot
                 self.send_robot_command(
-                    self.marker_locked_pose.position,
-                    self.marker_locked_pose.orientation
+                    self.target_tcp_pose['position'],
+                    self.target_tcp_pose['orientation']
                 )
             
             time.sleep(dt)

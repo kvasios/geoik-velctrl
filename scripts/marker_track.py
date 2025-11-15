@@ -13,7 +13,7 @@ import time
 import yaml
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 import argparse
 from pathlib import Path
 
@@ -42,17 +42,30 @@ class MarkerTracker:
                  board_marker_size: float = 0.04,  # 4cm
                  board_spacing: float = 0.01,  # 1cm
                  aruco_dict: str = "4x4_50",
-                 camera_fps: int = 30):
+                 camera_fps: int = 30,
+                 debug: bool = False,
+                 smoothing_factor: float = 0.7):
         
         # Network setup
         self.robot_ip = robot_ip
         self.robot_port = robot_port
         self.robot_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
+        # Debug mode
+        self.debug = debug
+        self.command_send_count = 0
+        self.last_command_log_time = time.time()
+        
+        # Smoothing (like VR code)
+        self.smoothing_factor = smoothing_factor
+        self.smoothed_position = np.array([0.0, 0.0, 0.0])
+        self.smoothed_orientation = np.array([0.0, 0.0, 0.0, 1.0])
+        
         # Tracking state
         self.tracking_active = False
         self.marker_locked_pose: Optional[MarkerPose] = None  # "Zero" reference when 't' was pressed
         self.current_marker_pose: Optional[MarkerPose] = None
+        self.last_processed_marker_pose: Optional[MarkerPose] = None  # Track if we've already processed this detection
         self.robot_base_pose = {
             'position': np.array([0.0, 0.0, 0.0]),  # Robot base reference (identity)
             'orientation': np.array([0.0, 0.0, 0.0, 1.0])
@@ -161,7 +174,10 @@ class MarkerTracker:
         self.command_thread.start()
         
         print("Marker Tracker initialized")
-        print(f"Robot: {robot_ip}:{robot_port}")
+        if debug:
+            print(f"Mode: DEBUG (commands NOT sent to robot)")
+        else:
+            print(f"Robot: {robot_ip}:{robot_port}")
         print(f"Marker type: {marker_type}")
         if use_board:
             print(f"ChArUco board: {board_rows}x{board_cols} squares")
@@ -172,6 +188,7 @@ class MarkerTracker:
             print(f"Marker size: {marker_size*100:.1f}cm")
         print(f"ArUco dict: {aruco_dict}")
         print(f"Camera FPS: {camera_fps}")
+        print(f"Smoothing: {smoothing_factor:.2f} (0=none, 0.9=heavy)")
         print("\nControls:")
         print("  't' - Start/Stop tracking")
         print("  'q' - Quit")
@@ -305,26 +322,54 @@ class MarkerTracker:
     def compute_visual_servoing_command(self):
         """
         Differential control: marker motion = TCP motion (like VR controller).
-        Exactly the same logic as vr_to_robot_converter.py
+        Applies smoothing exactly like vr_to_robot_converter.py
+        
+        IMPORTANT: Only update smoothing when we get NEW marker detection (camera ~30Hz),
+        but send commands at 100Hz (repeat last smoothed command until new detection).
         """
         if not self.tracking_active or self.marker_locked_pose is None or self.current_marker_pose is None:
             return
         
+        # Check if this is a new detection (only smooth on new data!)
+        # Compare by identity - if it's the same object, we've already processed it
+        if self.current_marker_pose is self.last_processed_marker_pose:
+            # No new detection - just keep sending the last smoothed command (already in target_tcp_pose)
+            return
+        
+        # Mark this detection as processed
+        self.last_processed_marker_pose = self.current_marker_pose
+        
         # Calculate marker pose delta from locked pose (like VR delta from initial)
         marker_pos_delta = self.current_marker_pose.position - self.marker_locked_pose.position
+        
+        # Apply smoothing to position delta (EMA filter)
+        self.smoothed_position = (self.smoothing_factor * self.smoothed_position + 
+                                  (1 - self.smoothing_factor) * marker_pos_delta)
         
         # Calculate relative rotation (like VR)
         locked_rot = Rotation.from_quat(self.marker_locked_pose.orientation)
         current_rot = Rotation.from_quat(self.current_marker_pose.orientation)
         relative_rot = current_rot * locked_rot.inv()
         
-        # Apply delta to robot base pose (exactly like VR code)
-        self.target_tcp_pose['position'] = self.robot_base_pose['position'] + marker_pos_delta
-        
-        # Apply relative rotation to base orientation
+        # Apply relative rotation to base orientation to get target orientation
         base_rot = Rotation.from_quat(self.robot_base_pose['orientation'])
-        target_rot = relative_rot * base_rot
-        self.target_tcp_pose['orientation'] = target_rot.as_quat()
+        target_rot = relative_rot * base_rot  # Unsmoothed target
+        
+        # Apply smoothing to TARGET orientation using Slerp (spherical linear interpolation)
+        # This matches VR code: smooth the target, not the delta
+        slerp_t = 1 - self.smoothing_factor
+        current_smoothed_rot = Rotation.from_quat(self.smoothed_orientation)
+        key_rotations = Rotation.from_quat([current_smoothed_rot.as_quat(), target_rot.as_quat()])
+        slerp = Slerp([0, 1], key_rotations)
+        smoothed_target_rot = slerp(slerp_t)
+        self.smoothed_orientation = smoothed_target_rot.as_quat()
+        
+        # Normalize quaternion to ensure it remains a unit quaternion
+        self.smoothed_orientation = self.smoothed_orientation / np.linalg.norm(self.smoothed_orientation)
+        
+        # Update target TCP pose with smoothed values
+        self.target_tcp_pose['position'] = self.robot_base_pose['position'] + self.smoothed_position
+        self.target_tcp_pose['orientation'] = self.smoothed_orientation
     
     def stop_tracking(self, reason: str = "User stopped"):
         """Stop tracking"""
@@ -339,7 +384,20 @@ class MarkerTracker:
             message = f"{position[0]:.6f} {position[1]:.6f} {position[2]:.6f} " + \
                      f"{orientation[0]:.6f} {orientation[1]:.6f} {orientation[2]:.6f} {orientation[3]:.6f}"
             
-            self.robot_socket.sendto(message.encode(), (self.robot_ip, self.robot_port))
+            # In debug mode, don't actually send (just visualize)
+            if not self.debug:
+                self.robot_socket.sendto(message.encode(), (self.robot_ip, self.robot_port))
+            
+            # Debug logging
+            if self.debug:
+                self.command_send_count += 1
+                current_time = time.time()
+                if current_time - self.last_command_log_time >= 1.0:
+                    print(f"[DEBUG] Commands sent: {self.command_send_count} Hz")
+                    print(f"  Target TCP: pos=[{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]")
+                    print(f"             quat=[{orientation[0]:.3f}, {orientation[1]:.3f}, {orientation[2]:.3f}, {orientation[3]:.3f}]")
+                    self.command_send_count = 0
+                    self.last_command_log_time = current_time
         except Exception as e:
             print(f"Error sending command: {e}")
     
@@ -367,6 +425,89 @@ class MarkerTracker:
             time_since_detection = time.time() - self.last_detection_time
             if time_since_detection > self.detection_timeout:
                 self.stop_tracking("Marker lost")
+    
+    def render_debug_window(self):
+        """Render debug visualization of command frame"""
+        if not self.debug or not self.tracking_active:
+            return
+        
+        # Create a 3D visualization canvas
+        canvas_size = 600
+        canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.uint8) * 40
+        
+        # Draw title
+        cv2.putText(canvas, "TCP Command Frame (Debug)", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Draw coordinate system in center
+        center = (canvas_size // 2, canvas_size // 2)
+        scale = 100  # pixels per meter
+        
+        # Draw base frame (gray)
+        base_x_end = (int(center[0] + scale * 0.5), center[1])
+        base_y_end = (center[0], int(center[1] - scale * 0.5))
+        cv2.line(canvas, center, base_x_end, (100, 100, 100), 2)
+        cv2.line(canvas, center, base_y_end, (100, 100, 100), 2)
+        cv2.putText(canvas, "Base", (center[0] + 10, center[1] + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+        
+        # Draw target TCP frame (colored)
+        if self.target_tcp_pose is not None:
+            pos = self.target_tcp_pose['position']
+            quat = self.target_tcp_pose['orientation']
+            
+            # Convert position to canvas coordinates
+            tcp_x = int(center[0] + pos[0] * scale)
+            tcp_y = int(center[1] - pos[2] * scale)  # Flip Y for display
+            
+            # Draw target position
+            cv2.circle(canvas, (tcp_x, tcp_y), 5, (0, 255, 255), -1)
+            
+            # Draw target orientation as arrows
+            rot = Rotation.from_quat(quat)
+            # X-axis (red)
+            x_dir = rot.apply([0.3, 0, 0])
+            x_end = (int(tcp_x + x_dir[0] * scale), int(tcp_y - x_dir[2] * scale))
+            cv2.arrowedLine(canvas, (tcp_x, tcp_y), x_end, (0, 0, 255), 2, tipLength=0.3)
+            
+            # Y-axis (green)
+            y_dir = rot.apply([0, 0.3, 0])
+            y_end = (int(tcp_x + y_dir[0] * scale), int(tcp_y - y_dir[2] * scale))
+            cv2.arrowedLine(canvas, (tcp_x, tcp_y), y_end, (0, 255, 0), 2, tipLength=0.3)
+            
+            # Z-axis (blue)
+            z_dir = rot.apply([0, 0, 0.3])
+            z_end = (int(tcp_x + z_dir[0] * scale), int(tcp_y - z_dir[2] * scale))
+            cv2.arrowedLine(canvas, (tcp_x, tcp_y), z_end, (255, 0, 0), 2, tipLength=0.3)
+            
+            # Show numerical values
+            info_y = 80
+            cv2.putText(canvas, f"Target TCP Pose:", (10, info_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(canvas, f"  Position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]m", 
+                       (10, info_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(canvas, f"  Quat: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]",
+                       (10, info_y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # Show marker delta if available
+            if self.marker_locked_pose and self.current_marker_pose:
+                delta_pos = self.current_marker_pose.position - self.marker_locked_pose.position
+                cv2.putText(canvas, f"Marker Delta (raw):", (10, info_y + 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(canvas, f"  [{delta_pos[0]:.3f}, {delta_pos[1]:.3f}, {delta_pos[2]:.3f}]m",
+                           (10, info_y + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.putText(canvas, f"Smoothed Delta:", (10, info_y + 145),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(canvas, f"  [{self.smoothed_position[0]:.3f}, {self.smoothed_position[1]:.3f}, {self.smoothed_position[2]:.3f}]m",
+                           (10, info_y + 170), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.putText(canvas, f"Smoothing factor: {self.smoothing_factor:.2f}",
+                           (10, info_y + 200), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        
+        # Show warning
+        cv2.putText(canvas, "[DEBUG MODE - Commands NOT sent to robot]", 
+                   (10, canvas_size - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+        
+        cv2.imshow('Debug: TCP Command Frame', canvas)
     
     def render_gui(self, color_image: np.ndarray) -> np.ndarray:
         """Render GUI with overlays"""
@@ -466,6 +607,10 @@ class MarkerTracker:
                 
                 # Show frame
                 cv2.imshow('Marker Tracker', display)
+                
+                # Render debug window if enabled
+                if self.debug:
+                    self.render_debug_window()
                 
                 # Handle keyboard input
                 key = cv2.waitKey(1) & 0xFF
@@ -659,6 +804,14 @@ Examples:
     parser.add_argument('--fps', type=int, default=30,
                        help='Camera FPS (default: 30)')
     
+    # Debug mode
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug mode (visualize commands, do NOT send to robot)')
+    
+    # Smoothing parameters
+    parser.add_argument('--smoothing', type=float, default=0.7,
+                       help='Smoothing factor (0.0=no smoothing, 0.9=heavy smoothing, default: 0.7)')
+    
     args = parser.parse_args()
     
     # Auto-detect YAML config if not provided
@@ -725,8 +878,18 @@ Examples:
             board_marker_size=board_marker_size if use_board else 0.04,
             board_spacing=board_spacing if use_board else 0.01,
             aruco_dict=aruco_dict,
-            camera_fps=args.fps
+            camera_fps=args.fps,
+            debug=args.debug,
+            smoothing_factor=args.smoothing
         )
+        
+        if args.debug:
+            print("\n" + "="*60)
+            print("DEBUG MODE ENABLED")
+            print("  - Commands will be visualized but NOT sent to robot")
+            print("  - Safe for testing without hardware")
+            print("="*60 + "\n")
+        
         tracker.run()
     except KeyboardInterrupt:
         print("\nInterrupted by user")

@@ -250,12 +250,7 @@ public:
             setDefaultBehavior(robot);
 
             // Move to a suitable starting joint configuration
-            std::array<double, 7> q_goal;
-            if (bidexhand_) {
-                q_goal = {{0.0, -0.812, -0.123, -2.0, 0.0, 2.8, 0.9}};  // BiDexHand pose
-            } else {
-                q_goal = {{0.0, -0.48, 0.0, -2.0, 0.0, 1.57, -0.85}};   // Full range pose
-            }
+            std::array<double, 7> q_goal = {{0.0, -M_PI/4, 0.0, -3*M_PI/4, 0.0, M_PI/2, M_PI/4}};
             MotionGenerator motion_generator(0.5, q_goal);
             std::cout << "WARNING: This example will move the robot! "
                       << "Please make sure to have the user stop button at hand!" << std::endl

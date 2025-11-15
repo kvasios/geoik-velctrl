@@ -1,0 +1,11 @@
+# Python dependencies for marker tracking scripts
+
+# Core dependencies
+numpy>=1.21.0
+opencv-contrib-python>=4.8.0  # Includes ArUco detection
+pyrealsense2>=2.54.0          # Intel RealSense SDK
+scipy>=1.7.0                  # For rotation handling
+
+# PDF generation (optional, for generate_marker.py)
+reportlab>=3.6.0
+pillow>=9.0.0

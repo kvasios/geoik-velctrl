@@ -44,7 +44,8 @@ class MarkerTracker:
                  aruco_dict: str = "4x4_50",
                  camera_fps: int = 30,
                  debug: bool = False,
-                 smoothing_factor: float = 0.7):
+                 smoothing_factor: float = 0.7,
+                 transform_mode: str = "camera_to_robot"):
         
         # Network setup
         self.robot_ip = robot_ip
@@ -55,6 +56,10 @@ class MarkerTracker:
         self.debug = debug
         self.command_send_count = 0
         self.last_command_log_time = time.time()
+        
+        # Coordinate frame transformation
+        self.transform_mode = transform_mode
+        self._setup_coordinate_transform()
         
         # Smoothing (like VR code)
         self.smoothing_factor = smoothing_factor
@@ -189,10 +194,84 @@ class MarkerTracker:
         print(f"ArUco dict: {aruco_dict}")
         print(f"Camera FPS: {camera_fps}")
         print(f"Smoothing: {smoothing_factor:.2f} (0=none, 0.9=heavy)")
+        print(f"Coordinate transform: {transform_mode}")
         print("\nControls:")
         print("  't' - Start/Stop tracking")
         print("  'q' - Quit")
+        print("  'f' - Cycle coordinate frame transform mode")
         print("\nWaiting for marker detection...")
+    
+    def _setup_coordinate_transform(self):
+        """Setup coordinate transformation matrix from camera to robot frame
+        
+        Based on VR converter (vr_to_robot_converter.py):
+        - VR: +x=right, +y=up, +z=forward
+        - Camera (RealSense): +x=right, +y=down, +z=forward  
+        - Robot (Franka): +x=forward, +y=left, +z=up
+        
+        Transformation:
+        - Robot_X = Camera_Z (forward)
+        - Robot_Y = -Camera_X (right becomes left)
+        - Robot_Z = -Camera_Y (down becomes up, note the flip!)
+        
+        Transformation modes:
+        - 'camera_to_robot': Standard transform matching VR converter
+        - 'identity': No transform (for debugging)
+        """
+        if self.transform_mode == "camera_to_robot":
+            # Camera-to-robot transform (matching VR converter logic)
+            # Since Camera Y is DOWN and VR Y is UP, we need to flip Y
+            self.camera_to_robot_position = np.array([
+                [0,  0,  1],  # Robot X = Camera Z (forward)
+                [-1, 0,  0],  # Robot Y = -Camera X (right→left)
+                [0, -1,  0]   # Robot Z = -Camera Y (down→up)
+            ])
+            
+            # For orientation, apply same transformation: R_robot = T * R_camera * T^(-1)
+            # (same as VR converter lines 284-288)
+            self.camera_to_robot_rotation = Rotation.from_matrix(self.camera_to_robot_position)
+            print(f"✓ Using camera-to-robot coordinate transform (VR-compatible)")
+            
+        elif self.transform_mode == "identity":
+            # No transform (for debugging)
+            self.camera_to_robot_position = np.eye(3)
+            self.camera_to_robot_rotation = Rotation.identity()
+            print(f"⚠ Using IDENTITY transform (camera frame = robot frame)")
+            
+        else:
+            raise ValueError(f"Unknown transform mode: {self.transform_mode}")
+    
+    def transform_camera_to_robot(self, camera_pos: np.ndarray, camera_quat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Transform position and orientation from camera frame to robot frame
+        
+        Uses the same transformation as VR converter:
+        - Position: robot_pos = T @ camera_pos
+        - Orientation: R_robot = T @ R_camera @ T^(-1)
+        """
+        # Transform position
+        robot_pos = self.camera_to_robot_position @ camera_pos
+        
+        # Transform orientation (matching VR converter logic)
+        camera_rot = Rotation.from_quat(camera_quat)
+        camera_matrix = camera_rot.as_matrix()
+        
+        # Apply transformation: R_robot = T * R_camera * T^(-1)
+        # Note: T is orthogonal so T^(-1) = T^T
+        robot_matrix = self.camera_to_robot_position @ camera_matrix @ self.camera_to_robot_position.T
+        
+        robot_rot = Rotation.from_matrix(robot_matrix)
+        robot_quat = robot_rot.as_quat()
+        
+        return robot_pos, robot_quat
+    
+    def cycle_transform_mode(self):
+        """Cycle through coordinate transform modes for debugging"""
+        modes = ["camera_to_robot", "identity"]
+        current_idx = modes.index(self.transform_mode)
+        next_idx = (current_idx + 1) % len(modes)
+        self.transform_mode = modes[next_idx]
+        self._setup_coordinate_transform()
+        print(f"\n→ Switched to transform mode: {self.transform_mode}")
     
     def detect_marker(self, color_image: np.ndarray) -> Optional[MarkerPose]:
         """Detect ArUco marker/ChArUco board and estimate 6D pose"""
@@ -339,21 +418,30 @@ class MarkerTracker:
         # Mark this detection as processed
         self.last_processed_marker_pose = self.current_marker_pose
         
-        # Calculate marker pose delta from locked pose (like VR delta from initial)
-        marker_pos_delta = self.current_marker_pose.position - self.marker_locked_pose.position
+        # Calculate marker pose delta from locked pose IN CAMERA FRAME
+        marker_pos_delta_cam = self.current_marker_pose.position - self.marker_locked_pose.position
         
-        # Apply smoothing to position delta (EMA filter)
+        # Transform delta to robot frame
+        marker_pos_delta_robot = self.camera_to_robot_position @ marker_pos_delta_cam
+        
+        # Apply smoothing to position delta (EMA filter) IN ROBOT FRAME
         self.smoothed_position = (self.smoothing_factor * self.smoothed_position + 
-                                  (1 - self.smoothing_factor) * marker_pos_delta)
+                                  (1 - self.smoothing_factor) * marker_pos_delta_robot)
         
-        # Calculate relative rotation (like VR)
-        locked_rot = Rotation.from_quat(self.marker_locked_pose.orientation)
-        current_rot = Rotation.from_quat(self.current_marker_pose.orientation)
-        relative_rot = current_rot * locked_rot.inv()
+        # Calculate relative rotation IN CAMERA FRAME
+        locked_rot_cam = Rotation.from_quat(self.marker_locked_pose.orientation)
+        current_rot_cam = Rotation.from_quat(self.current_marker_pose.orientation)
+        relative_rot_cam = current_rot_cam * locked_rot_cam.inv()
+        
+        # Transform relative rotation to robot frame using matrix transform
+        # R_robot = T @ R_camera @ T^T (where T is the coordinate transform matrix)
+        relative_matrix_cam = relative_rot_cam.as_matrix()
+        relative_matrix_robot = self.camera_to_robot_position @ relative_matrix_cam @ self.camera_to_robot_position.T
+        relative_rot_robot = Rotation.from_matrix(relative_matrix_robot)
         
         # Apply relative rotation to base orientation to get target orientation
         base_rot = Rotation.from_quat(self.robot_base_pose['orientation'])
-        target_rot = relative_rot * base_rot  # Unsmoothed target
+        target_rot = relative_rot_robot * base_rot  # Unsmoothed target
         
         # Apply smoothing to TARGET orientation using Slerp (spherical linear interpolation)
         # This matches VR code: smooth the target, not the delta
@@ -393,9 +481,17 @@ class MarkerTracker:
                 self.command_send_count += 1
                 current_time = time.time()
                 if current_time - self.last_command_log_time >= 1.0:
-                    print(f"[DEBUG] Commands sent: {self.command_send_count} Hz")
-                    print(f"  Target TCP: pos=[{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]")
-                    print(f"             quat=[{orientation[0]:.3f}, {orientation[1]:.3f}, {orientation[2]:.3f}, {orientation[3]:.3f}]")
+                    print(f"\n[DEBUG] Commands sent: {self.command_send_count} Hz")
+                    print(f"  Target TCP (Robot Frame):")
+                    print(f"    Position: X:{position[0]:+.3f} Y:{position[1]:+.3f} Z:{position[2]:+.3f}m")
+                    print(f"    Quat:     x:{orientation[0]:+.3f} y:{orientation[1]:+.3f} z:{orientation[2]:+.3f} w:{orientation[3]:+.3f}")
+                    if self.marker_locked_pose and self.current_marker_pose:
+                        delta_cam = self.current_marker_pose.position - self.marker_locked_pose.position
+                        delta_robot = self.camera_to_robot_position @ delta_cam
+                        print(f"  Marker Delta (Camera):  X:{delta_cam[0]:+.3f} Y:{delta_cam[1]:+.3f} Z:{delta_cam[2]:+.3f}m")
+                        print(f"  Marker Delta (Robot):   X:{delta_robot[0]:+.3f} Y:{delta_robot[1]:+.3f} Z:{delta_robot[2]:+.3f}m")
+                        print(f"  Smoothed Delta (Robot): X:{self.smoothed_position[0]:+.3f} Y:{self.smoothed_position[1]:+.3f} Z:{self.smoothed_position[2]:+.3f}m")
+                    print(f"  Transform mode: {self.transform_mode}")
                     self.command_send_count = 0
                     self.last_command_log_time = current_time
         except Exception as e:
@@ -491,17 +587,29 @@ class MarkerTracker:
             
             # Show marker delta if available
             if self.marker_locked_pose and self.current_marker_pose:
-                delta_pos = self.current_marker_pose.position - self.marker_locked_pose.position
-                cv2.putText(canvas, f"Marker Delta (raw):", (10, info_y + 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(canvas, f"  [{delta_pos[0]:.3f}, {delta_pos[1]:.3f}, {delta_pos[2]:.3f}]m",
-                           (10, info_y + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                cv2.putText(canvas, f"Smoothed Delta:", (10, info_y + 145),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(canvas, f"  [{self.smoothed_position[0]:.3f}, {self.smoothed_position[1]:.3f}, {self.smoothed_position[2]:.3f}]m",
-                           (10, info_y + 170), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                cv2.putText(canvas, f"Smoothing factor: {self.smoothing_factor:.2f}",
-                           (10, info_y + 200), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                # Camera frame delta
+                delta_pos_cam = self.current_marker_pose.position - self.marker_locked_pose.position
+                cv2.putText(canvas, f"Marker Delta (Camera Frame):", (10, info_y + 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 200, 255), 1)
+                cv2.putText(canvas, f"  X:{delta_pos_cam[0]:+.3f} Y:{delta_pos_cam[1]:+.3f} Z:{delta_pos_cam[2]:+.3f}m",
+                           (10, info_y + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 200, 255), 1)
+                
+                # Robot frame delta (transformed)
+                delta_pos_robot = self.camera_to_robot_position @ delta_pos_cam
+                cv2.putText(canvas, f"Marker Delta (Robot Frame):", (10, info_y + 145),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
+                cv2.putText(canvas, f"  X:{delta_pos_robot[0]:+.3f} Y:{delta_pos_robot[1]:+.3f} Z:{delta_pos_robot[2]:+.3f}m",
+                           (10, info_y + 170), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 100), 1)
+                
+                cv2.putText(canvas, f"Smoothed Delta (Robot):", (10, info_y + 200),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(canvas, f"  X:{self.smoothed_position[0]:+.3f} Y:{self.smoothed_position[1]:+.3f} Z:{self.smoothed_position[2]:+.3f}m",
+                           (10, info_y + 225), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                
+                cv2.putText(canvas, f"Transform: {self.transform_mode}",
+                           (10, info_y + 260), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                cv2.putText(canvas, f"Smoothing: {self.smoothing_factor:.2f}",
+                           (10, info_y + 285), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
         
         # Show warning
         cv2.putText(canvas, "[DEBUG MODE - Commands NOT sent to robot]", 
@@ -545,10 +653,13 @@ class MarkerTracker:
             status_color = (0, 255, 0)
             self.draw_marker_frame(display, self.current_marker_pose)
             
-            # Show marker position
-            pos = self.current_marker_pose.position
-            cv2.putText(display, f"Position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]m",
-                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            # Show marker position in both frames
+            pos_cam = self.current_marker_pose.position
+            pos_robot, _ = self.transform_camera_to_robot(pos_cam, self.current_marker_pose.orientation)
+            cv2.putText(display, f"Camera: X:{pos_cam[0]:+.3f} Y:{pos_cam[1]:+.3f} Z:{pos_cam[2]:+.3f}m",
+                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
+            cv2.putText(display, f"Robot:  X:{pos_robot[0]:+.3f} Y:{pos_robot[1]:+.3f} Z:{pos_robot[2]:+.3f}m",
+                       (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 100), 1)
         else:
             if self.use_board:
                 status_text = "No ChArUco board detected"
@@ -574,9 +685,9 @@ class MarkerTracker:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, tracking_color, 2)
         
         # Controls
-        controls = "Controls: [t] Track  [q] Quit"
+        controls = f"Controls: [t] Track  [f] Frame ({self.transform_mode})  [q] Quit"
         cv2.putText(display, controls, (10, h - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
         
         return display
     
@@ -623,6 +734,9 @@ class MarkerTracker:
                         self.start_tracking()
                     else:
                         self.stop_tracking("User stopped")
+                elif key == ord('f'):
+                    # Cycle coordinate transform mode
+                    self.cycle_transform_mode()
         
         finally:
             self.cleanup()
@@ -812,6 +926,11 @@ Examples:
     parser.add_argument('--smoothing', type=float, default=0.7,
                        help='Smoothing factor (0.0=no smoothing, 0.9=heavy smoothing, default: 0.7)')
     
+    # Coordinate transform mode
+    parser.add_argument('--transform', type=str, default='camera_to_robot',
+                       choices=['camera_to_robot', 'identity'],
+                       help='Coordinate transform mode (default: camera_to_robot)')
+    
     args = parser.parse_args()
     
     # Auto-detect YAML config if not provided
@@ -880,7 +999,8 @@ Examples:
             aruco_dict=aruco_dict,
             camera_fps=args.fps,
             debug=args.debug,
-            smoothing_factor=args.smoothing
+            smoothing_factor=args.smoothing,
+            transform_mode=args.transform
         )
         
         if args.debug:

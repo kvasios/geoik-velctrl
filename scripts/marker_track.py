@@ -33,7 +33,7 @@ class MarkerTracker:
     """Real-time marker tracking with RealSense camera"""
     
     def __init__(self, 
-                 robot_ip: str = "192.168.18.1", 
+                 robot_ip: str = "192.168.122.100", 
                  robot_port: int = 8888,
                  marker_size: float = 0.05,  # 5cm marker
                  use_board: bool = False,
@@ -769,8 +769,8 @@ Examples:
                        help='Path to YAML config file (overrides other marker args)')
     
     # Network parameters
-    parser.add_argument('--robot-ip', type=str, default='192.168.18.1',
-                       help='Robot IP address (default: 192.168.18.1)')
+    parser.add_argument('--robot-ip', type=str, default='192.168.122.100',
+                       help='Robot IP address (default: 192.168.122.100)')
     parser.add_argument('--robot-port', type=int, default=8888,
                        help='Robot UDP port (default: 8888)')
     

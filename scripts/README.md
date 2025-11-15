@@ -71,7 +71,7 @@ Auto-detects the latest generated marker YAML in `markers/` directory.
 
 ```bash
 python3 marker_track.py \
-  --robot-ip 192.168.18.1 \
+  --robot-ip 192.168.122.100 \
   --robot-port 8888 \
   --config markers/board_4x4_4x4_50.yaml \
   --fps 30 \

@@ -112,6 +112,10 @@ private:
     // Visual servo filtered state
     Eigen::Vector3d vs_filtered_position_{0, 0, 0};
     Eigen::Quaterniond vs_filtered_orientation_{1, 0, 0, 0};
+    
+    // Measurement timeout (safety: stop if marker lost)
+    std::chrono::steady_clock::time_point last_measurement_time_;
+    static constexpr double VS_MEASUREMENT_TIMEOUT_SEC = 0.2;  // 200ms (generous for 30Hz camera)
 
 public:
     VelocityServer(bool bidexhand = true, bool vs_mode = false)
@@ -189,6 +193,7 @@ public:
                             std::lock_guard<std::mutex> lock(command_mutex_);
                             T_ee_marker_meas_ = T;
                             vs_has_meas_ = true;
+                            last_measurement_time_ = std::chrono::steady_clock::now();  // Update timeout timer
 
                             // Note: reference locking happens in control loop (needs robot_state)
 
@@ -288,6 +293,21 @@ private:
     {
         if (!vs_mode_ || !vs_has_meas_ || !initialized_)
         {
+            return;
+        }
+
+        // Check measurement timeout (marker lost = safety stop)
+        auto current_time = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(current_time - last_measurement_time_).count();
+        
+        if (elapsed > VS_MEASUREMENT_TIMEOUT_SEC)
+        {
+            if (vs_has_ref_)
+            {
+                std::cout << "Visual servo: marker lost (timeout " << elapsed*1000 << "ms), resetting reference." << std::endl;
+                vs_has_ref_ = false;  // Require new lock when measurements resume
+            }
+            // Keep last target (freeze in place) - don't update target_position/orientation
             return;
         }
 

@@ -331,8 +331,9 @@ private:
         // Transform delta to base frame
         Eigen::Vector3d marker_delta_base = T_base_ee_current.rotation() * marker_delta_ee;
         
-        // Move EE opposite to marker motion to restore reference offset
-        Eigen::Vector3d raw_target_pos = T_base_ee_current.translation() - marker_delta_base;
+        // Move EE in same direction as marker moved to maintain relative offset
+        // (If marker moved +5cm in EE frame, EE must move +5cm in base to keep marker at same EE position)
+        Eigen::Vector3d raw_target_pos = T_base_ee_current.translation() + marker_delta_base;
         
         // Keep current orientation (no orientation servoing)
         Eigen::Quaterniond raw_target_quat = Eigen::Quaterniond(T_base_ee_current.rotation());

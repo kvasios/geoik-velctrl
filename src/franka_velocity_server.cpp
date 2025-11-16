@@ -461,7 +461,8 @@ public:
             setDefaultBehavior(robot);
 
             // Move to a suitable starting joint configuration
-            std::array<double, 7> q_goal = {{0.0, -M_PI/4, 0.0, -3*M_PI/4, 0.0, M_PI/2, M_PI/4}};
+            std::array<double, 7> q_goal = {{0.0214559, -0.0798026, 0.0509775, -2.29811, -0.0108799,2.20993, 0.824406}};
+            std::array<double, 7> q_neutral = {{0.0, -M_PI/4, 0.0, -3*M_PI/4, 0.0, M_PI/2, M_PI/4}};
             MotionGenerator motion_generator(0.5, q_goal);
             std::cout << "WARNING: This example will move the robot! "
                       << "Please make sure to have the user stop button at hand!" << std::endl
@@ -487,7 +488,7 @@ public:
             // Initialize joint angles
             for (int i = 0; i < 7; i++) {
                 current_joint_angles_[i] = state.q[i];
-                neutral_joint_pose_[i] = q_goal[i];  // Use the initial joint configuration as neutral
+                neutral_joint_pose_[i] = q_neutral[i];  // Use the initial joint configuration as neutral
             }
             
             // Create IK solver with neutral pose and weights

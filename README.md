@@ -28,12 +28,12 @@ pip install -r requirements.txt
 ### 3. Run Marker Tracker
 
 ```bash
-python3 scripts/marker_track.py --config markers/board_4x4_4x4_50.yaml
+python3 scripts/marker_track.py
 ```
 
 Press `t` to start/stop tracking. The robot maintains the locked end-effector-to-marker pose as you move the marker.
 
-## Custom Build
+## Server RT Custom Build
 
 To build from source:
 

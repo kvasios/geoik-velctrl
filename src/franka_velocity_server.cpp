@@ -53,9 +53,11 @@ private:
         double max_position_offset = 0.75;   // 75cm from initial position
         
         // Visual servoing specific parameters
-        double vs_servo_gain = 0.3;       // Proportional gain for VS (0.1-1.0, lower = slower/more stable)
-        double vs_smoothing = 0.85;       // EMA smoothing for VS target (0.0-0.95, higher = smoother)
-        double vs_position_deadband = 0.002;  // 2mm deadband for VS
+        double vs_position_gain = 0.4;           // Position gain (0.1-1.0, how fast to follow position)
+        double vs_orientation_gain = 0.1;        // Orientation gain (0.01-0.5, how fast to follow rotation)
+        double vs_smoothing = 0.85;              // EMA smoothing for VS target (0.0-0.95, higher = smoother)
+        double vs_position_deadband = 0.002;     // 2mm position deadband (ignore small position errors)
+        double vs_orientation_deadband = 0.02;   // ~1.15° orientation deadband (ignore small rotation errors)
     } params_;
 
     // Target Pose (in robot base frame)
@@ -334,9 +336,11 @@ private:
             target_orientation_ = vs_filtered_orientation_;
 
             std::cout << "Visual servo: locked reference EE→marker." << std::endl;
-            std::cout << "  Servo gain: " << params_.vs_servo_gain 
-                      << ", Smoothing: " << params_.vs_smoothing 
-                      << ", Deadband: " << params_.vs_position_deadband*1000 << "mm" << std::endl;
+            std::cout << "  Position gain: " << params_.vs_position_gain 
+                      << ", Orientation gain: " << params_.vs_orientation_gain << std::endl;
+            std::cout << "  Smoothing: " << params_.vs_smoothing << std::endl;
+            std::cout << "  Deadbands: position " << params_.vs_position_deadband*1000 << "mm"
+                      << ", orientation " << params_.vs_orientation_deadband*180/M_PI << "°" << std::endl;
             return;
         }
 
@@ -375,12 +379,12 @@ private:
             raw_target_quat.coeffs() = -raw_target_quat.coeffs();
         }
         
-        // Compute position delta from current EE
+        // ===== POSITION GAIN & DEADBAND =====
         Eigen::Vector3d current_pos = T_base_ee_current.translation();
         Eigen::Vector3d pos_delta = raw_target_pos - current_pos;
         
-        // Apply proportional gain to delta (damping)
-        pos_delta *= params_.vs_servo_gain;
+        // Apply proportional gain to position (damping)
+        pos_delta *= params_.vs_position_gain;
         
         // Apply per-axis deadband to prevent micro-oscillations
         for (int i = 0; i < 3; ++i)
@@ -394,10 +398,27 @@ private:
         // Compute damped target position
         Eigen::Vector3d damped_target_pos = current_pos + pos_delta;
         
-        // Apply smoothing (EMA filter)
+        // ===== ORIENTATION GAIN & DEADBAND =====
+        // Compute angular distance between current and target orientation
+        double angular_distance = 2.0 * std::acos(std::abs(current_quat.dot(raw_target_quat)));
+        
+        Eigen::Quaterniond damped_target_quat;
+        if (angular_distance < params_.vs_orientation_deadband)
+        {
+            // Within deadband: keep current orientation (no rotation command)
+            damped_target_quat = current_quat;
+        }
+        else
+        {
+            // Apply gain through SLERP (move only a fraction towards target)
+            damped_target_quat = current_quat.slerp(params_.vs_orientation_gain, raw_target_quat);
+        }
+        damped_target_quat.normalize();
+        
+        // ===== SMOOTHING (EMA filter for both position and orientation) =====
         double alpha = 1.0 - params_.vs_smoothing;
         vs_filtered_position_ = params_.vs_smoothing * vs_filtered_position_ + alpha * damped_target_pos;
-        vs_filtered_orientation_ = vs_filtered_orientation_.slerp(alpha, raw_target_quat);
+        vs_filtered_orientation_ = vs_filtered_orientation_.slerp(alpha, damped_target_quat);
         vs_filtered_orientation_.normalize();
         
         // Set final target

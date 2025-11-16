@@ -15,8 +15,6 @@ servobox pkg-install geoik-velctrl
 servobox run geoik-velctrl <robot-ip> false vs
 ```
 
-Arguments: `<robot-ip>` `<bidexhand: true/false>` `<mode: vs for visual servo, vr for VR>`
-
 ### 2. Install Python Marker Tracking
 
 Create environment with micromamba (or conda/mamba):
@@ -34,6 +32,19 @@ python3 scripts/marker_track.py --config markers/board_4x4_4x4_50.yaml
 ```
 
 Press `t` to start/stop tracking. The robot maintains the locked end-effector-to-marker pose as you move the marker.
+
+## Custom Build
+
+To build from source:
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+./franka_velocity_server <robot-ip> <bidexhand> <mode>
+```
+
+**Arguments:** `<robot-ip>` `<bidexhand: true/false>` `<mode: vs for visual servo, vr for VR>`
 
 ## Attribution
 

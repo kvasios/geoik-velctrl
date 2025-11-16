@@ -320,9 +320,9 @@ private:
             return;
         }
 
-        // Servo law: Position-only tracking to restore EE→marker reference offset
-        // (Orientation servoing disabled due to quaternion ambiguity issues)
+        // Servo law: Track marker position and orientation
         
+        // ===== POSITION SERVOING =====
         // Compute marker position offset from reference in EE frame
         Eigen::Vector3d marker_pos_ref = T_ee_marker_ref_.translation();
         Eigen::Vector3d marker_pos_meas = T_ee_marker_meas_.translation();
@@ -332,12 +332,28 @@ private:
         Eigen::Vector3d marker_delta_base = T_base_ee_current.rotation() * marker_delta_ee;
         
         // Move EE in same direction as marker moved to maintain relative offset
-        // (If marker moved +5cm in EE frame, EE must move +5cm in base to keep marker at same EE position)
         Eigen::Vector3d raw_target_pos = T_base_ee_current.translation() + marker_delta_base;
         
-        // Keep current orientation (no orientation servoing)
-        Eigen::Quaterniond raw_target_quat = Eigen::Quaterniond(T_base_ee_current.rotation());
+        // ===== ORIENTATION SERVOING =====
+        // Goal: Maintain EE→marker relative orientation
+        // R_base_ee_target * R_ee_marker_ref = R_base_ee_current * R_ee_marker_meas
+        // Therefore: R_base_ee_target = R_base_ee_current * R_ee_marker_meas * R_ee_marker_ref^T
+        
+        Eigen::Matrix3d R_base_ee_current = T_base_ee_current.rotation();
+        Eigen::Matrix3d R_ee_marker_ref = T_ee_marker_ref_.rotation();
+        Eigen::Matrix3d R_ee_marker_meas = T_ee_marker_meas_.rotation();
+        
+        Eigen::Matrix3d R_base_ee_target = R_base_ee_current * R_ee_marker_meas * R_ee_marker_ref.transpose();
+        
+        Eigen::Quaterniond raw_target_quat(R_base_ee_target);
+        Eigen::Quaterniond current_quat(R_base_ee_current);
         raw_target_quat.normalize();
+        current_quat.normalize();
+        
+        // Handle quaternion double-cover: ensure we take the shortest path
+        if (raw_target_quat.dot(current_quat) < 0.0) {
+            raw_target_quat.coeffs() = -raw_target_quat.coeffs();
+        }
         
         // Compute position delta from current EE
         Eigen::Vector3d current_pos = T_base_ee_current.translation();

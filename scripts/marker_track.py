@@ -55,13 +55,13 @@ class MarkerTracker:
         self.command_send_count = 0
         self.last_command_log_time = time.time()
         
-        # Camera-to-end-effector transform: -90° around Z axis
-        # Camera X → EE -Y, Camera Y → EE X, Camera Z → EE Z
+        # Camera-to-end-effector transform: +90° around Z axis
+        # Camera X → EE Y, Camera Y → EE -X, Camera Z → EE Z
         # (camera and EE Z both point from sensor towards the marker / scene)
-        self.direct_mapping = lambda cam: np.array([cam[1], -cam[0], cam[2]])
+        self.direct_mapping = lambda cam: np.array([-cam[1], cam[0], cam[2]])
         self.orientation_transform_matrix = np.array([
-            [0,  1,  0],  # EE X = Camera Y
-            [-1, 0,  0],  # EE Y = -Camera X
+            [0, -1,  0],  # EE X = -Camera Y
+            [1,  0,  0],  # EE Y = Camera X
             [0,  0,  1]   # EE Z = Camera Z
         ])
         
@@ -195,8 +195,8 @@ class MarkerTracker:
         print(f"  Temporal smoothing: {self.measurement_smoothing:.2f} (0=none, 0.9=max)")
         print(f"  Outlier threshold: {self.outlier_threshold*1000:.0f}mm (jump rejection)")
         print(f"  Corner refinement: {self.detector_params.cornerRefinementMaxIterations} iterations")
-        print(f"\nEye-in-hand: Camera on end-effector, -90° Z rotation")
-        print("  Camera Y → EE X, -Camera X → EE Y, Camera Z → EE Z")
+        print(f"\nEye-in-hand: Camera on end-effector, +90° Z rotation")
+        print("  -Camera Y → EE X, Camera X → EE Y, Camera Z → EE Z")
         print("  Server transforms EE-relative poses to base frame in real-time")
         print("\nControls:")
         print("  't' - Start/Stop tracking")

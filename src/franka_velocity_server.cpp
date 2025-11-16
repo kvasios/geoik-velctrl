@@ -320,17 +320,22 @@ private:
             return;
         }
 
-        // Servo law: Position EE such that EE→marker stays at reference relative pose.
-        //
-        // We want: T_base_ee_target * T_ee_marker_ref = T_base_marker_current,
-        // where T_base_marker_current = T_base_ee_current * T_ee_marker_meas.
-        //
-        // Thus: T_base_ee_target = T_base_ee_current * T_ee_marker_meas * (T_ee_marker_ref)^(-1)
-        Eigen::Affine3d T_base_ee_target_raw =
-            T_base_ee_current * T_ee_marker_meas_ * T_ee_marker_ref_.inverse();
+        // Servo law: Position-only tracking to restore EE→marker reference offset
+        // (Orientation servoing disabled due to quaternion ambiguity issues)
         
-        Eigen::Vector3d raw_target_pos = T_base_ee_target_raw.translation();
-        Eigen::Quaterniond raw_target_quat(T_base_ee_target_raw.rotation());
+        // Compute marker position offset from reference in EE frame
+        Eigen::Vector3d marker_pos_ref = T_ee_marker_ref_.translation();
+        Eigen::Vector3d marker_pos_meas = T_ee_marker_meas_.translation();
+        Eigen::Vector3d marker_delta_ee = marker_pos_meas - marker_pos_ref;
+        
+        // Transform delta to base frame
+        Eigen::Vector3d marker_delta_base = T_base_ee_current.rotation() * marker_delta_ee;
+        
+        // Move EE opposite to marker motion to restore reference offset
+        Eigen::Vector3d raw_target_pos = T_base_ee_current.translation() - marker_delta_base;
+        
+        // Keep current orientation (no orientation servoing)
+        Eigen::Quaterniond raw_target_quat = Eigen::Quaterniond(T_base_ee_current.rotation());
         raw_target_quat.normalize();
         
         // Compute position delta from current EE

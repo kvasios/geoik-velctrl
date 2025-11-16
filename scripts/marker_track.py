@@ -44,8 +44,9 @@ class MarkerTracker:
                  aruco_dict: str = "4x4_50",
                  camera_fps: int = 30,
                  debug: bool = False,
-                 smoothing_factor: float = 0.7,
-                 transform_mode: str = "camera_to_robot"):
+                 smoothing_factor: float = 0.85,  # Higher for 30Hz marker rate
+                 position_scale: float = 0.5,  # Scale factor for position deltas
+                 position_deadband: float = 0.002):  # 2mm deadband
         
         # Network setup
         self.robot_ip = robot_ip
@@ -57,12 +58,21 @@ class MarkerTracker:
         self.command_send_count = 0
         self.last_command_log_time = time.time()
         
-        # Coordinate frame transformation
-        self.transform_mode = transform_mode
-        self._setup_coordinate_transform()
+        # Camera-to-end-effector transform: -90° around Z axis
+        # Camera X → EE -Y, Camera Y → EE X, Camera Z → EE Z
+        self.direct_mapping = lambda cam: np.array([cam[1], -cam[0], cam[2]])
+        self.orientation_transform_matrix = np.array([
+            [0,  1,  0],  # EE X = Camera Y
+            [-1, 0,  0],  # EE Y = -Camera X
+            [0,  0,  1]   # EE Z = Camera Z
+        ])
         
-        # Smoothing (like VR code)
+        # Control parameters
         self.smoothing_factor = smoothing_factor
+        self.position_scale = position_scale  # Gain for position control
+        self.position_deadband = position_deadband  # Deadband to prevent oscillation
+        
+        # Smoothed state
         self.smoothed_position = np.array([0.0, 0.0, 0.0])
         self.smoothed_orientation = np.array([0.0, 0.0, 0.0, 1.0])
         
@@ -136,10 +146,8 @@ class MarkerTracker:
         self.config = rs.config()
         
         # Enable color stream only (max resolution for better detection)
-        # Try max resolution first, fallback to lower if not supported
         resolution_attempts = [
-            (1280, 720, "1280x720"),
-            (640, 480, "640x480")
+            (1280, 800, "1280x800")
         ]
         
         profile = None
@@ -193,85 +201,35 @@ class MarkerTracker:
             print(f"Marker size: {marker_size*100:.1f}cm")
         print(f"ArUco dict: {aruco_dict}")
         print(f"Camera FPS: {camera_fps}")
-        print(f"Smoothing: {smoothing_factor:.2f} (0=none, 0.9=heavy)")
-        print(f"Coordinate transform: {transform_mode}")
+        print(f"Control parameters:")
+        print(f"  Smoothing: {smoothing_factor:.2f} (0=none, 0.95=max)")
+        print(f"  Position scale: {position_scale:.2f} (gain/sensitivity)")
+        print(f"  Position deadband: {position_deadband*1000:.1f}mm (anti-oscillation)")
+        print(f"\nEye-in-hand: Camera on end-effector, -90° Z rotation")
+        print("  Camera Y → EE X, -Camera X → EE Y, Camera Z → EE Z")
+        print("  Server transforms EE-relative poses to base frame in real-time")
         print("\nControls:")
         print("  't' - Start/Stop tracking")
         print("  'q' - Quit")
-        print("  'f' - Cycle coordinate frame transform mode")
         print("\nWaiting for marker detection...")
     
-    def _setup_coordinate_transform(self):
-        """Setup coordinate transformation matrix from camera to robot frame
+    def transform_camera_to_ee(self, camera_pos: np.ndarray, camera_quat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Transform position and orientation from camera frame to end-effector frame
         
-        Based on VR converter (vr_to_robot_converter.py):
-        - VR: +x=right, +y=up, +z=forward
-        - Camera (RealSense): +x=right, +y=down, +z=forward  
-        - Robot (Franka): +x=forward, +y=left, +z=up
-        
-        Transformation:
-        - Robot_X = Camera_Z (forward)
-        - Robot_Y = -Camera_X (right becomes left)
-        - Robot_Z = -Camera_Y (down becomes up, note the flip!)
-        
-        Transformation modes:
-        - 'camera_to_robot': Standard transform matching VR converter
-        - 'identity': No transform (for debugging)
+        Camera is mounted on end-effector with -90° rotation around Z axis.
+        Server will transform from EE frame to base frame using real-time robot state.
         """
-        if self.transform_mode == "camera_to_robot":
-            # Camera-to-robot transform (matching VR converter logic)
-            # Since Camera Y is DOWN and VR Y is UP, we need to flip Y
-            self.camera_to_robot_position = np.array([
-                [0,  0,  1],  # Robot X = Camera Z (forward)
-                [-1, 0,  0],  # Robot Y = -Camera X (right→left)
-                [0, -1,  0]   # Robot Z = -Camera Y (down→up)
-            ])
-            
-            # For orientation, apply same transformation: R_robot = T * R_camera * T^(-1)
-            # (same as VR converter lines 284-288)
-            self.camera_to_robot_rotation = Rotation.from_matrix(self.camera_to_robot_position)
-            print(f"✓ Using camera-to-robot coordinate transform (VR-compatible)")
-            
-        elif self.transform_mode == "identity":
-            # No transform (for debugging)
-            self.camera_to_robot_position = np.eye(3)
-            self.camera_to_robot_rotation = Rotation.identity()
-            print(f"⚠ Using IDENTITY transform (camera frame = robot frame)")
-            
-        else:
-            raise ValueError(f"Unknown transform mode: {self.transform_mode}")
-    
-    def transform_camera_to_robot(self, camera_pos: np.ndarray, camera_quat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Transform position and orientation from camera frame to robot frame
+        # Transform position: Camera → EE frame
+        ee_pos = self.direct_mapping(camera_pos)
         
-        Uses the same transformation as VR converter:
-        - Position: robot_pos = T @ camera_pos
-        - Orientation: R_robot = T @ R_camera @ T^(-1)
-        """
-        # Transform position
-        robot_pos = self.camera_to_robot_position @ camera_pos
-        
-        # Transform orientation (matching VR converter logic)
+        # Transform orientation: Camera → EE frame
         camera_rot = Rotation.from_quat(camera_quat)
         camera_matrix = camera_rot.as_matrix()
+        ee_matrix = self.orientation_transform_matrix @ camera_matrix @ self.orientation_transform_matrix.T
+        ee_rot = Rotation.from_matrix(ee_matrix)
+        ee_quat = ee_rot.as_quat()
         
-        # Apply transformation: R_robot = T * R_camera * T^(-1)
-        # Note: T is orthogonal so T^(-1) = T^T
-        robot_matrix = self.camera_to_robot_position @ camera_matrix @ self.camera_to_robot_position.T
-        
-        robot_rot = Rotation.from_matrix(robot_matrix)
-        robot_quat = robot_rot.as_quat()
-        
-        return robot_pos, robot_quat
-    
-    def cycle_transform_mode(self):
-        """Cycle through coordinate transform modes for debugging"""
-        modes = ["camera_to_robot", "identity"]
-        current_idx = modes.index(self.transform_mode)
-        next_idx = (current_idx + 1) % len(modes)
-        self.transform_mode = modes[next_idx]
-        self._setup_coordinate_transform()
-        print(f"\n→ Switched to transform mode: {self.transform_mode}")
+        return ee_pos, ee_quat
     
     def detect_marker(self, color_image: np.ndarray) -> Optional[MarkerPose]:
         """Detect ArUco marker/ChArUco board and estimate 6D pose"""
@@ -421,12 +379,20 @@ class MarkerTracker:
         # Calculate marker pose delta from locked pose IN CAMERA FRAME
         marker_pos_delta_cam = self.current_marker_pose.position - self.marker_locked_pose.position
         
-        # Transform delta to robot frame
-        marker_pos_delta_robot = self.camera_to_robot_position @ marker_pos_delta_cam
+        # Transform delta to robot frame using configured mapping
+        marker_pos_delta_robot = self.direct_mapping(marker_pos_delta_cam)
+        
+        # Apply position scale (gain) to delta
+        scaled_delta = marker_pos_delta_robot * self.position_scale
+        
+        # Apply deadband per-axis to prevent micro-oscillations
+        for i in range(3):
+            if abs(scaled_delta[i]) < self.position_deadband:
+                scaled_delta[i] = 0.0
         
         # Apply smoothing to position delta (EMA filter) IN ROBOT FRAME
         self.smoothed_position = (self.smoothing_factor * self.smoothed_position + 
-                                  (1 - self.smoothing_factor) * marker_pos_delta_robot)
+                                  (1 - self.smoothing_factor) * scaled_delta)
         
         # Calculate relative rotation IN CAMERA FRAME
         locked_rot_cam = Rotation.from_quat(self.marker_locked_pose.orientation)
@@ -436,7 +402,7 @@ class MarkerTracker:
         # Transform relative rotation to robot frame using matrix transform
         # R_robot = T @ R_camera @ T^T (where T is the coordinate transform matrix)
         relative_matrix_cam = relative_rot_cam.as_matrix()
-        relative_matrix_robot = self.camera_to_robot_position @ relative_matrix_cam @ self.camera_to_robot_position.T
+        relative_matrix_robot = self.orientation_transform_matrix @ relative_matrix_cam @ self.orientation_transform_matrix.T
         relative_rot_robot = Rotation.from_matrix(relative_matrix_robot)
         
         # Apply relative rotation to base orientation to get target orientation
@@ -467,9 +433,14 @@ class MarkerTracker:
             print(f"\n✗ Tracking stopped: {reason}")
     
     def send_robot_command(self, position: np.ndarray, orientation: np.ndarray):
-        """Send pose command to robot via UDP"""
+        """Send EE-relative pose command to robot via UDP
+        
+        Sends with "EE" prefix to indicate end-effector relative frame.
+        Server transforms to base frame using real-time robot state.
+        """
         try:
-            message = f"{position[0]:.6f} {position[1]:.6f} {position[2]:.6f} " + \
+            # Format: "EE x y z qx qy qz qw" (EE-relative frame)
+            message = f"EE {position[0]:.6f} {position[1]:.6f} {position[2]:.6f} " + \
                      f"{orientation[0]:.6f} {orientation[1]:.6f} {orientation[2]:.6f} {orientation[3]:.6f}"
             
             # In debug mode, don't actually send (just visualize)
@@ -482,16 +453,18 @@ class MarkerTracker:
                 current_time = time.time()
                 if current_time - self.last_command_log_time >= 1.0:
                     print(f"\n[DEBUG] Commands sent: {self.command_send_count} Hz")
-                    print(f"  Target TCP (Robot Frame):")
+                    print(f"  Marker in EE Frame (sent to server):")
                     print(f"    Position: X:{position[0]:+.3f} Y:{position[1]:+.3f} Z:{position[2]:+.3f}m")
                     print(f"    Quat:     x:{orientation[0]:+.3f} y:{orientation[1]:+.3f} z:{orientation[2]:+.3f} w:{orientation[3]:+.3f}")
                     if self.marker_locked_pose and self.current_marker_pose:
                         delta_cam = self.current_marker_pose.position - self.marker_locked_pose.position
-                        delta_robot = self.camera_to_robot_position @ delta_cam
-                        print(f"  Marker Delta (Camera):  X:{delta_cam[0]:+.3f} Y:{delta_cam[1]:+.3f} Z:{delta_cam[2]:+.3f}m")
-                        print(f"  Marker Delta (Robot):   X:{delta_robot[0]:+.3f} Y:{delta_robot[1]:+.3f} Z:{delta_robot[2]:+.3f}m")
-                        print(f"  Smoothed Delta (Robot): X:{self.smoothed_position[0]:+.3f} Y:{self.smoothed_position[1]:+.3f} Z:{self.smoothed_position[2]:+.3f}m")
-                    print(f"  Transform mode: {self.transform_mode}")
+                        delta_ee = self.direct_mapping(delta_cam)
+                        scaled_delta = delta_ee * self.position_scale
+                        print(f"  Marker Delta (Camera): X:{delta_cam[0]:+.3f} Y:{delta_cam[1]:+.3f} Z:{delta_cam[2]:+.3f}m")
+                        print(f"  Marker Delta (EE):     X:{delta_ee[0]:+.3f} Y:{delta_ee[1]:+.3f} Z:{delta_ee[2]:+.3f}m")
+                        print(f"  Scaled Delta (x{self.position_scale:.2f}): X:{scaled_delta[0]:+.3f} Y:{scaled_delta[1]:+.3f} Z:{scaled_delta[2]:+.3f}m")
+                        print(f"  Smoothed Delta (EE):   X:{self.smoothed_position[0]:+.3f} Y:{self.smoothed_position[1]:+.3f} Z:{self.smoothed_position[2]:+.3f}m")
+                    print(f"  (Server transforms EE→Base using real-time robot state)")
                     self.command_send_count = 0
                     self.last_command_log_time = current_time
         except Exception as e:
@@ -532,7 +505,7 @@ class MarkerTracker:
         canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.uint8) * 40
         
         # Draw title
-        cv2.putText(canvas, "TCP Command Frame (Debug)", (10, 30),
+        cv2.putText(canvas, "EE-Relative Command (Debug)", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # Draw coordinate system in center
@@ -594,22 +567,30 @@ class MarkerTracker:
                 cv2.putText(canvas, f"  X:{delta_pos_cam[0]:+.3f} Y:{delta_pos_cam[1]:+.3f} Z:{delta_pos_cam[2]:+.3f}m",
                            (10, info_y + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 200, 255), 1)
                 
-                # Robot frame delta (transformed)
-                delta_pos_robot = self.camera_to_robot_position @ delta_pos_cam
-                cv2.putText(canvas, f"Marker Delta (Robot Frame):", (10, info_y + 145),
+                # EE frame delta (transformed from camera)
+                delta_pos_ee = self.direct_mapping(delta_pos_cam)
+                cv2.putText(canvas, f"EE Delta (raw):", (10, info_y + 145),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
-                cv2.putText(canvas, f"  X:{delta_pos_robot[0]:+.3f} Y:{delta_pos_robot[1]:+.3f} Z:{delta_pos_robot[2]:+.3f}m",
+                cv2.putText(canvas, f"  X:{delta_pos_ee[0]:+.3f} Y:{delta_pos_ee[1]:+.3f} Z:{delta_pos_ee[2]:+.3f}m",
                            (10, info_y + 170), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 100), 1)
                 
-                cv2.putText(canvas, f"Smoothed Delta (Robot):", (10, info_y + 200),
+                # Scaled delta
+                scaled_delta = delta_pos_ee * self.position_scale
+                cv2.putText(canvas, f"Scaled Delta (x{self.position_scale:.2f}):", (10, info_y + 200),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 150, 50), 1)
+                cv2.putText(canvas, f"  X:{scaled_delta[0]:+.3f} Y:{scaled_delta[1]:+.3f} Z:{scaled_delta[2]:+.3f}m",
+                           (10, info_y + 225), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 150, 50), 1)
+                
+                # Smoothed output (in EE frame, sent to server)
+                cv2.putText(canvas, f"Smoothed EE Delta (sent):", (10, info_y + 255),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 cv2.putText(canvas, f"  X:{self.smoothed_position[0]:+.3f} Y:{self.smoothed_position[1]:+.3f} Z:{self.smoothed_position[2]:+.3f}m",
-                           (10, info_y + 225), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                           (10, info_y + 280), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
                 
-                cv2.putText(canvas, f"Transform: {self.transform_mode}",
-                           (10, info_y + 260), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-                cv2.putText(canvas, f"Smoothing: {self.smoothing_factor:.2f}",
-                           (10, info_y + 285), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                cv2.putText(canvas, f"Settings: scale={self.position_scale:.2f} smooth={self.smoothing_factor:.2f} db={self.position_deadband*1000:.1f}mm",
+                           (10, info_y + 315), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                cv2.putText(canvas, f"Cam→EE: -90deg Z | Server: EE→Base (real-time)",
+                           (10, info_y + 340), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
         
         # Show warning
         cv2.putText(canvas, "[DEBUG MODE - Commands NOT sent to robot]", 
@@ -653,12 +634,12 @@ class MarkerTracker:
             status_color = (0, 255, 0)
             self.draw_marker_frame(display, self.current_marker_pose)
             
-            # Show marker position in both frames
+            # Show marker position in camera and EE frames
             pos_cam = self.current_marker_pose.position
-            pos_robot, _ = self.transform_camera_to_robot(pos_cam, self.current_marker_pose.orientation)
+            pos_ee, _ = self.transform_camera_to_ee(pos_cam, self.current_marker_pose.orientation)
             cv2.putText(display, f"Camera: X:{pos_cam[0]:+.3f} Y:{pos_cam[1]:+.3f} Z:{pos_cam[2]:+.3f}m",
                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
-            cv2.putText(display, f"Robot:  X:{pos_robot[0]:+.3f} Y:{pos_robot[1]:+.3f} Z:{pos_robot[2]:+.3f}m",
+            cv2.putText(display, f"EE:     X:{pos_ee[0]:+.3f} Y:{pos_ee[1]:+.3f} Z:{pos_ee[2]:+.3f}m",
                        (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 100), 1)
         else:
             if self.use_board:
@@ -685,9 +666,9 @@ class MarkerTracker:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, tracking_color, 2)
         
         # Controls
-        controls = f"Controls: [t] Track  [f] Frame ({self.transform_mode})  [q] Quit"
+        controls = "Controls: [t] Track  [q] Quit"
         cv2.putText(display, controls, (10, h - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
         return display
     
@@ -734,9 +715,6 @@ class MarkerTracker:
                         self.start_tracking()
                     else:
                         self.stop_tracking("User stopped")
-                elif key == ord('f'):
-                    # Cycle coordinate transform mode
-                    self.cycle_transform_mode()
         
         finally:
             self.cleanup()
@@ -922,14 +900,13 @@ Examples:
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug mode (visualize commands, do NOT send to robot)')
     
-    # Smoothing parameters
-    parser.add_argument('--smoothing', type=float, default=0.7,
-                       help='Smoothing factor (0.0=no smoothing, 0.9=heavy smoothing, default: 0.7)')
-    
-    # Coordinate transform mode
-    parser.add_argument('--transform', type=str, default='camera_to_robot',
-                       choices=['camera_to_robot', 'identity'],
-                       help='Coordinate transform mode (default: camera_to_robot)')
+    # Control parameters
+    parser.add_argument('--smoothing', type=float, default=0.85,
+                       help='Smoothing factor (0.0=no smoothing, 0.95=max, default: 0.85 for 30Hz)')
+    parser.add_argument('--position-scale', type=float, default=0.5,
+                       help='Position gain/scale factor (0.1-2.0, default: 0.5)')
+    parser.add_argument('--position-deadband', type=float, default=0.002,
+                       help='Position deadband in meters (default: 0.002 = 2mm)')
     
     args = parser.parse_args()
     
@@ -1000,7 +977,8 @@ Examples:
             camera_fps=args.fps,
             debug=args.debug,
             smoothing_factor=args.smoothing,
-            transform_mode=args.transform
+            position_scale=args.position_scale,
+            position_deadband=args.position_deadband
         )
         
         if args.debug:

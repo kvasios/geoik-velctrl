@@ -28,6 +28,7 @@ struct PoseCommand
     double pos_x = 0.0, pos_y = 0.0, pos_z = 0.0;
     double quat_x = 0.0, quat_y = 0.0, quat_z = 0.0, quat_w = 1.0;
     bool has_valid_data = false;
+    bool is_ee_relative = false;  // If true, pose is in end-effector frame (for eye-in-hand)
 };
 
 class VelocityServer
@@ -149,14 +150,36 @@ public:
                 buffer[bytes_received] = '\0';
 
                 PoseCommand cmd;
-                int parsed_count = sscanf(buffer, "%lf %lf %lf %lf %lf %lf %lf",
-                                          &cmd.pos_x, &cmd.pos_y, &cmd.pos_z,
-                                          &cmd.quat_x, &cmd.quat_y, &cmd.quat_z, &cmd.quat_w);
-
-                if (parsed_count == 7)
+                
+                // Check for "EE" prefix to indicate end-effector relative frame
+                std::string message(buffer);
+                if (message.substr(0, 3) == "EE ")
                 {
-                    cmd.has_valid_data = true;
+                    cmd.is_ee_relative = true;
+                    // Parse after "EE " prefix
+                    int parsed_count = sscanf(buffer + 3, "%lf %lf %lf %lf %lf %lf %lf",
+                                              &cmd.pos_x, &cmd.pos_y, &cmd.pos_z,
+                                              &cmd.quat_x, &cmd.quat_y, &cmd.quat_z, &cmd.quat_w);
+                    if (parsed_count == 7)
+                    {
+                        cmd.has_valid_data = true;
+                    }
+                }
+                else
+                {
+                    // Base frame (VR mode) - original format
+                    cmd.is_ee_relative = false;
+                    int parsed_count = sscanf(buffer, "%lf %lf %lf %lf %lf %lf %lf",
+                                              &cmd.pos_x, &cmd.pos_y, &cmd.pos_z,
+                                              &cmd.quat_x, &cmd.quat_y, &cmd.quat_z, &cmd.quat_w);
+                    if (parsed_count == 7)
+                    {
+                        cmd.has_valid_data = true;
+                    }
+                }
 
+                if (cmd.has_valid_data)
+                {
                     std::lock_guard<std::mutex> lock(command_mutex_);
                     current_pose_command_ = cmd;
 
@@ -169,7 +192,15 @@ public:
                         filtered_orientation_ = initial_command_orientation_;
 
                         initialized_ = true;
-                        std::cout << "Initial pose command received and processed!" << std::endl;
+                        
+                        if (cmd.is_ee_relative)
+                        {
+                            std::cout << "Initial EE-relative pose command received (eye-in-hand mode)!" << std::endl;
+                        }
+                        else
+                        {
+                            std::cout << "Initial base-frame pose command received (VR mode)!" << std::endl;
+                        }
                     }
                 }
             }
@@ -180,17 +211,30 @@ public:
 
 private:
     // Calculate the desired target pose from incoming pose commands
-    void updateTargetPose(const PoseCommand &cmd)
+    void updateTargetPose(const PoseCommand &cmd, const franka::RobotState &robot_state)
     {
         if (!cmd.has_valid_data || !initialized_)
         {
             return;
         }
 
-        // Current commanded pose
+        // Current commanded pose (in either EE or BASE frame depending on flag)
         Eigen::Vector3d cmd_pos(cmd.pos_x, cmd.pos_y, cmd.pos_z);
         Eigen::Quaterniond cmd_quat(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z);
         cmd_quat.normalize();
+
+        // If EE-relative, transform to BASE frame using current robot state
+        if (cmd.is_ee_relative)
+        {
+            // Get current end-effector pose in base frame
+            Eigen::Affine3d current_ee_pose(Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
+            
+            // Transform marker pose from EE frame to BASE frame
+            cmd_pos = current_ee_pose * cmd_pos;
+            cmd_quat = Eigen::Quaterniond(current_ee_pose.rotation()) * cmd_quat;
+            cmd_quat.normalize();
+        }
+        // else: cmd_pos and cmd_quat are already in BASE frame (VR mode)
 
         // Smooth incoming data to reduce jitter
         double alpha = 1.0 - params_.smoothing;
@@ -357,7 +401,7 @@ private:
                 std::lock_guard<std::mutex> lock(command_mutex_);
                 cmd = current_pose_command_;
             }
-            updateTargetPose(cmd);
+            updateTargetPose(cmd, robot_state);
 
             // Initialize Ruckig with actual robot state on first call
             if (!ruckig_initialized_) {

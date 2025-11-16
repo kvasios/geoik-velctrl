@@ -43,7 +43,7 @@ private:
     // Control parameters
     struct ControlParams
     {
-        double smoothing = 0.05;       // Less for more responsive control
+        double smoothing = 0.05;       // Less for more responsive control (VR mode)
 
         // Deadzones to prevent drift from small sensor noise
         double position_deadzone = 0.001;   // 1mm
@@ -51,6 +51,11 @@ private:
 
         // Workspace limits to keep the robot in a safe area
         double max_position_offset = 0.75;   // 75cm from initial position
+        
+        // Visual servoing specific parameters
+        double vs_servo_gain = 0.3;       // Proportional gain for VS (0.1-1.0, lower = slower/more stable)
+        double vs_smoothing = 0.85;       // EMA smoothing for VS target (0.0-0.95, higher = smoother)
+        double vs_position_deadband = 0.002;  // 2mm deadband for VS
     } params_;
 
     // Target Pose (in robot base frame)
@@ -102,6 +107,10 @@ private:
     bool vs_has_meas_ = false;      // do we have at least one measurement?
     Eigen::Affine3d T_base_marker_ref_;  // reference BASE→marker (marker position in base frame at lock)
     Eigen::Affine3d T_ee_marker_meas_;   // latest measured EE→marker
+    
+    // Visual servo filtered state
+    Eigen::Vector3d vs_filtered_position_{0, 0, 0};
+    Eigen::Quaterniond vs_filtered_orientation_{1, 0, 0, 0};
 
 public:
     VelocityServer(bool bidexhand = true, bool vs_mode = false)
@@ -291,25 +300,70 @@ private:
             T_base_marker_ref_ = T_base_ee_current * T_ee_marker_meas_;
             vs_has_ref_ = true;
             
+            // Initialize filtered state to current pose
+            vs_filtered_position_ = T_base_ee_current.translation();
+            vs_filtered_orientation_ = Eigen::Quaterniond(T_base_ee_current.rotation());
+            
             // Initialize target to current pose (no motion initially)
-            target_position_ = T_base_ee_current.translation();
-            target_orientation_ = Eigen::Quaterniond(T_base_ee_current.rotation());
+            target_position_ = vs_filtered_position_;
+            target_orientation_ = vs_filtered_orientation_;
             
             std::cout << "Visual servo: locked reference BASE→marker at ["
                       << T_base_marker_ref_.translation().x() << ", "
                       << T_base_marker_ref_.translation().y() << ", "
                       << T_base_marker_ref_.translation().z() << "]" << std::endl;
+            std::cout << "  Servo gain: " << params_.vs_servo_gain 
+                      << ", Smoothing: " << params_.vs_smoothing 
+                      << ", Deadband: " << params_.vs_position_deadband*1000 << "mm" << std::endl;
             return;
         }
 
         // Servo law: Position EE such that marker stays at reference position in BASE frame
         // We want: T_base_ee_target * T_ee_marker_meas = T_base_marker_ref
-        // Therefore: T_base_ee_target = T_base_marker_ref * T_ee_marker_meas^(-1)
-        Eigen::Affine3d T_base_ee_target = T_base_marker_ref_ * T_ee_marker_meas_.inverse();
-
-        target_position_ = T_base_ee_target.translation();
-        target_orientation_ = Eigen::Quaterniond(T_base_ee_target.rotation());
-        target_orientation_.normalize();
+        // Therefore: T_base_ee_target_raw = T_base_marker_ref * T_ee_marker_meas^(-1)
+        Eigen::Affine3d T_base_ee_target_raw = T_base_marker_ref_ * T_ee_marker_meas_.inverse();
+        
+        Eigen::Vector3d raw_target_pos = T_base_ee_target_raw.translation();
+        Eigen::Quaterniond raw_target_quat(T_base_ee_target_raw.rotation());
+        raw_target_quat.normalize();
+        
+        // Compute position delta from current EE
+        Eigen::Vector3d current_pos = T_base_ee_current.translation();
+        Eigen::Vector3d pos_delta = raw_target_pos - current_pos;
+        
+        // Apply proportional gain to delta (damping)
+        pos_delta *= params_.vs_servo_gain;
+        
+        // Apply per-axis deadband to prevent micro-oscillations
+        for (int i = 0; i < 3; ++i)
+        {
+            if (std::abs(pos_delta[i]) < params_.vs_position_deadband)
+            {
+                pos_delta[i] = 0.0;
+            }
+        }
+        
+        // Compute damped target position
+        Eigen::Vector3d damped_target_pos = current_pos + pos_delta;
+        
+        // Apply smoothing (EMA filter)
+        double alpha = 1.0 - params_.vs_smoothing;
+        vs_filtered_position_ = params_.vs_smoothing * vs_filtered_position_ + alpha * damped_target_pos;
+        vs_filtered_orientation_ = vs_filtered_orientation_.slerp(alpha, raw_target_quat);
+        vs_filtered_orientation_.normalize();
+        
+        // Set final target
+        target_position_ = vs_filtered_position_;
+        target_orientation_ = vs_filtered_orientation_;
+        
+        // Debug output (every 100 cycles)
+        static int debug_counter = 0;
+        if (++debug_counter % 100 == 0)
+        {
+            std::cout << "VS: delta_norm=" << pos_delta.norm() 
+                      << " target=[" << target_position_.x() << ", "
+                      << target_position_.y() << ", " << target_position_.z() << "]" << std::endl;
+        }
     }
 
     // Helper function to clamp q7 within limits

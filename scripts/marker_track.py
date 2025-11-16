@@ -433,14 +433,14 @@ class MarkerTracker:
             print(f"\n✗ Tracking stopped: {reason}")
     
     def send_robot_command(self, position: np.ndarray, orientation: np.ndarray):
-        """Send EE-relative pose command to robot via UDP
-        
-        Sends with "EE" prefix to indicate end-effector relative frame.
-        Server transforms to base frame using real-time robot state.
+        """Send EE-relative pose measurement to robot via UDP
+
+        Format: \"x y z qx qy qz qw\" (all in end-effector frame).
+        Server (visual-servo mode) interprets this as T_ee_marker_meas.
         """
         try:
-            # Format: "EE x y z qx qy qz qw" (EE-relative frame)
-            message = f"EE {position[0]:.6f} {position[1]:.6f} {position[2]:.6f} " + \
+            # Format: "x y z qx qy qz qw" (EE-relative frame)
+            message = f"{position[0]:.6f} {position[1]:.6f} {position[2]:.6f} " + \
                      f"{orientation[0]:.6f} {orientation[1]:.6f} {orientation[2]:.6f} {orientation[3]:.6f}"
             
             # In debug mode, don't actually send (just visualize)
@@ -476,15 +476,14 @@ class MarkerTracker:
         dt = 1.0 / rate
         
         while self.running:
-            if self.tracking_active:
-                # Compute visual servoing command to maintain marker pose
-                self.compute_visual_servoing_command()
-                
-                # Send target TCP pose to robot
-                self.send_robot_command(
-                    self.target_tcp_pose['position'],
-                    self.target_tcp_pose['orientation']
+            if self.tracking_active and self.current_marker_pose is not None and self.current_marker_pose.detected:
+                # Compute marker pose in EE frame (eye-in-hand measurement)
+                pos_ee, quat_ee = self.transform_camera_to_ee(
+                    self.current_marker_pose.position,
+                    self.current_marker_pose.orientation
                 )
+                # Send measurement to server; server handles visual servoing
+                self.send_robot_command(pos_ee, quat_ee)
             
             time.sleep(dt)
     

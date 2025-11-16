@@ -28,7 +28,6 @@ struct PoseCommand
     double pos_x = 0.0, pos_y = 0.0, pos_z = 0.0;
     double quat_x = 0.0, quat_y = 0.0, quat_z = 0.0, quat_w = 1.0;
     bool has_valid_data = false;
-    bool is_ee_relative = false;  // If true, pose is in end-effector frame (for eye-in-hand)
 };
 
 class VelocityServer
@@ -97,9 +96,19 @@ private:
     static constexpr std::array<double, 7> MAX_JOINT_JERK = {8.0, 8.0, 8.0, 8.0, 12.0, 12.0, 12.0};  // Higher jerk for snappier response
     static constexpr double CONTROL_CYCLE_TIME = 0.001;  // 1 kHz
 
+    // Visual servoing (eye-in-hand) mode flag
+    bool vs_mode_ = false;          // true: interpret incoming data as EE-relative marker pose
+    bool vs_has_ref_ = false;       // have we locked the reference EE→marker transform?
+    bool vs_has_meas_ = false;      // do we have at least one measurement?
+    Eigen::Affine3d T_ee_marker_ref_;   // reference EE→marker
+    Eigen::Affine3d T_ee_marker_meas_;  // latest measured EE→marker
+
 public:
-    VelocityServer(bool bidexhand = true)
-        : Q7_MIN(bidexhand ? -0.2 : -2.89), Q7_MAX(bidexhand ? 1.9 : 2.89), bidexhand_(bidexhand)
+    VelocityServer(bool bidexhand = true, bool vs_mode = false)
+        : Q7_MIN(bidexhand ? -0.2 : -2.89),
+          Q7_MAX(bidexhand ? 1.9 : 2.89),
+          bidexhand_(bidexhand),
+          vs_mode_(vs_mode)
     {
         setupNetworking();
     }
@@ -148,57 +157,71 @@ public:
             if (bytes_received > 0)
             {
                 buffer[bytes_received] = '\0';
-
-                PoseCommand cmd;
-                
-                // Check for "EE" prefix to indicate end-effector relative frame
                 std::string message(buffer);
-                if (message.substr(0, 3) == "EE ")
+
+                if (vs_mode_)
                 {
-                    cmd.is_ee_relative = true;
-                    // Parse after "EE " prefix
-                    int parsed_count = sscanf(buffer + 3, "%lf %lf %lf %lf %lf %lf %lf",
-                                              &cmd.pos_x, &cmd.pos_y, &cmd.pos_z,
-                                              &cmd.quat_x, &cmd.quat_y, &cmd.quat_z, &cmd.quat_w);
-                    if (parsed_count == 7)
+                    // Visual-servo mode: interpret incoming data as EE→marker measurement
+                    double px, py, pz, qx, qy, qz, qw;
+                    int parsed = std::sscanf(message.c_str(), "%lf %lf %lf %lf %lf %lf %lf",
+                                             &px, &py, &pz, &qx, &qy, &qz, &qw);
+                    if (parsed == 7)
                     {
-                        cmd.has_valid_data = true;
+                        Eigen::Vector3d p(px, py, pz);
+                        Eigen::Quaterniond q(qw, qx, qy, qz);
+                        q.normalize();
+
+                        Eigen::Affine3d T;
+                        T.linear() = q.toRotationMatrix();
+                        T.translation() = p;
+
+                        {
+                            std::lock_guard<std::mutex> lock(command_mutex_);
+                            T_ee_marker_meas_ = T;
+                            vs_has_meas_ = true;
+
+                            if (!vs_has_ref_)
+                            {
+                                T_ee_marker_ref_ = T;
+                                vs_has_ref_ = true;
+                                std::cout << "Visual servo: reference EE→marker locked from first measurement." << std::endl;
+                            }
+
+                            if (!initialized_)
+                            {
+                                initialized_ = true;
+                                std::cout << "Visual servo: first measurement received, starting control." << std::endl;
+                            }
+                        }
                     }
                 }
                 else
                 {
-                    // Base frame (VR mode) - original format
-                    cmd.is_ee_relative = false;
-                    int parsed_count = sscanf(buffer, "%lf %lf %lf %lf %lf %lf %lf",
-                                              &cmd.pos_x, &cmd.pos_y, &cmd.pos_z,
-                                              &cmd.quat_x, &cmd.quat_y, &cmd.quat_z, &cmd.quat_w);
+                    // VR / base-frame mode: interpret incoming data as base-frame pose command
+                    PoseCommand cmd;
+                    int parsed_count = std::sscanf(message.c_str(), "%lf %lf %lf %lf %lf %lf %lf",
+                                                   &cmd.pos_x, &cmd.pos_y, &cmd.pos_z,
+                                                   &cmd.quat_x, &cmd.quat_y, &cmd.quat_z, &cmd.quat_w);
+
                     if (parsed_count == 7)
                     {
                         cmd.has_valid_data = true;
                     }
-                }
 
-                if (cmd.has_valid_data)
-                {
-                    std::lock_guard<std::mutex> lock(command_mutex_);
-                    current_pose_command_ = cmd;
-
-                    if (!initialized_)
+                    if (cmd.has_valid_data)
                     {
-                        initial_command_position_ = Eigen::Vector3d(cmd.pos_x, cmd.pos_y, cmd.pos_z);
-                        initial_command_orientation_ = Eigen::Quaterniond(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z).normalized();
+                        std::lock_guard<std::mutex> lock(command_mutex_);
+                        current_pose_command_ = cmd;
 
-                        filtered_position_ = initial_command_position_;
-                        filtered_orientation_ = initial_command_orientation_;
+                        if (!initialized_)
+                        {
+                            initial_command_position_ = Eigen::Vector3d(cmd.pos_x, cmd.pos_y, cmd.pos_z);
+                            initial_command_orientation_ = Eigen::Quaterniond(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z).normalized();
 
-                        initialized_ = true;
-                        
-                        if (cmd.is_ee_relative)
-                        {
-                            std::cout << "Initial EE-relative pose command received (eye-in-hand mode)!" << std::endl;
-                        }
-                        else
-                        {
+                            filtered_position_ = initial_command_position_;
+                            filtered_orientation_ = initial_command_orientation_;
+
+                            initialized_ = true;
                             std::cout << "Initial base-frame pose command received (VR mode)!" << std::endl;
                         }
                     }
@@ -210,31 +233,18 @@ public:
     }
 
 private:
-    // Calculate the desired target pose from incoming pose commands
-    void updateTargetPose(const PoseCommand &cmd, const franka::RobotState &robot_state)
+    // Calculate the desired target pose from incoming base-frame pose commands (VR mode)
+    void updateTargetPose(const PoseCommand &cmd)
     {
         if (!cmd.has_valid_data || !initialized_)
         {
             return;
         }
 
-        // Current commanded pose (in either EE or BASE frame depending on flag)
+        // Current commanded pose in BASE frame
         Eigen::Vector3d cmd_pos(cmd.pos_x, cmd.pos_y, cmd.pos_z);
         Eigen::Quaterniond cmd_quat(cmd.quat_w, cmd.quat_x, cmd.quat_y, cmd.quat_z);
         cmd_quat.normalize();
-
-        // If EE-relative, transform to BASE frame using current robot state
-        if (cmd.is_ee_relative)
-        {
-            // Get current end-effector pose in base frame
-            Eigen::Affine3d current_ee_pose(Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
-            
-            // Transform marker pose from EE frame to BASE frame
-            cmd_pos = current_ee_pose * cmd_pos;
-            cmd_quat = Eigen::Quaterniond(current_ee_pose.rotation()) * cmd_quat;
-            cmd_quat.normalize();
-        }
-        // else: cmd_pos and cmd_quat are already in BASE frame (VR mode)
 
         // Smooth incoming data to reduce jitter
         double alpha = 1.0 - params_.smoothing;
@@ -265,6 +275,30 @@ private:
         // The final calculation updates the target pose
         target_position_ = initial_robot_pose_.translation() + pos_delta;
         target_orientation_ = quat_delta * Eigen::Quaterniond(initial_robot_pose_.rotation());
+        target_orientation_.normalize();
+    }
+
+    // Visual servo: compute EE target pose from EE→marker reference & measurement
+    void updateVisualServoTarget(const franka::RobotState &robot_state)
+    {
+        if (!vs_mode_ || !vs_has_ref_ || !vs_has_meas_ || !initialized_)
+        {
+            return;
+        }
+
+        // Current base→ee
+        Eigen::Affine3d T_base_ee_current(
+            Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
+
+        // Current base→marker = base→ee * ee→marker_meas
+        Eigen::Affine3d T_base_marker_current = T_base_ee_current * T_ee_marker_meas_;
+
+        // Desired base→ee_target = base→marker_current * (ee→marker_ref)^(-1)
+        Eigen::Affine3d T_base_ee_target =
+            T_base_marker_current * T_ee_marker_ref_.inverse();
+
+        target_position_ = T_base_ee_target.translation();
+        target_orientation_ = Eigen::Quaterniond(T_base_ee_target.rotation());
         target_orientation_.normalize();
     }
 
@@ -395,13 +429,19 @@ private:
                                        const franka::RobotState &robot_state,
                                        franka::Duration period) -> franka::JointVelocities
         {
-            // Update target pose from latest command
-            PoseCommand cmd;
+            // Update target pose from latest command / visual servoing
             {
                 std::lock_guard<std::mutex> lock(command_mutex_);
-                cmd = current_pose_command_;
+                if (vs_mode_)
+                {
+                    updateVisualServoTarget(robot_state);
+                }
+                else
+                {
+                    PoseCommand cmd = current_pose_command_;
+                    updateTargetPose(cmd);
+                }
             }
-            updateTargetPose(cmd, robot_state);
 
             // Initialize Ruckig with actual robot state on first call
             if (!ruckig_initialized_) {
@@ -525,23 +565,35 @@ private:
 
 int main(int argc, char **argv)
 {
-    if (argc < 2 || argc > 3)
+    if (argc < 2 || argc > 4)
     {
-        std::cerr << "Usage: " << argv[0] << " <robot-hostname> [bidexhand]" << std::endl;
+        std::cerr << "Usage: " << argv[0]
+                  << " <robot-hostname> [bidexhand] [mode]" << std::endl;
         std::cerr << "  bidexhand: true (default) for BiDexHand limits, false for full range" << std::endl;
+        std::cerr << "  mode: vr (default) for base-frame VR control, vs for eye-in-hand visual servo" << std::endl;
         return -1;
     }
 
     bool bidexhand = false;
-    if (argc == 3)
+    if (argc >= 3)
     {
         std::string bidexhand_arg = argv[2];
         bidexhand = (bidexhand_arg == "true" || bidexhand_arg == "1");
     }
 
+    bool vs_mode = false;
+    if (argc == 4)
+    {
+        std::string mode_arg = argv[3];
+        if (mode_arg == "vs" || mode_arg == "visual_servo")
+        {
+            vs_mode = true;
+        }
+    }
+
     try
     {
-        VelocityServer server(bidexhand);
+        VelocityServer server(bidexhand, vs_mode);
         // Add a signal handler to gracefully shut down on Ctrl+C
         server.run(argv[1]);
     }

@@ -2,6 +2,8 @@
 
 A geometric IK-based velocity control server for the Franka Emika robot.
 
+![Demo](data/media/demo.gif)
+
 ## Overview
 
 This standalone server receives end-effector pose commands via UDP and controls the Franka robot using:

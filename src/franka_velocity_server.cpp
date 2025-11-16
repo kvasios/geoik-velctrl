@@ -103,9 +103,10 @@ private:
 
     // Visual servoing (eye-in-hand) mode flag
     bool vs_mode_ = false;          // true: interpret incoming data as EE-relative marker pose
-    bool vs_has_ref_ = false;       // have we locked the reference BASE→marker transform?
+    bool vs_has_ref_ = false;       // have we locked the reference EE→marker transform?
     bool vs_has_meas_ = false;      // do we have at least one measurement?
-    Eigen::Affine3d T_base_marker_ref_;  // reference BASE→marker (marker position in base frame at lock)
+    Eigen::Affine3d T_base_marker_ref_;  // (optional) BASE→marker at lock, for debug only
+    Eigen::Affine3d T_ee_marker_ref_;    // reference EE→marker (relative pose we want to keep)
     Eigen::Affine3d T_ee_marker_meas_;   // latest measured EE→marker
     
     // Visual servo filtered state
@@ -294,34 +295,39 @@ private:
         Eigen::Affine3d T_base_ee_current(
             Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
 
-        // Lock reference on first call: store marker position in BASE frame
+        // Lock reference on first call: store EE→marker reference (relative pose)
         if (!vs_has_ref_)
         {
-            T_base_marker_ref_ = T_base_ee_current * T_ee_marker_meas_;
+            // Reference: keep this EE→marker transform constant while marker moves in world
+            T_ee_marker_ref_ = T_ee_marker_meas_;
             vs_has_ref_ = true;
-            
+
+            // Optionally store BASE→marker at lock for debugging
+            T_base_marker_ref_ = T_base_ee_current * T_ee_marker_meas_;
+
             // Initialize filtered state to current pose
             vs_filtered_position_ = T_base_ee_current.translation();
             vs_filtered_orientation_ = Eigen::Quaterniond(T_base_ee_current.rotation());
-            
+
             // Initialize target to current pose (no motion initially)
             target_position_ = vs_filtered_position_;
             target_orientation_ = vs_filtered_orientation_;
-            
-            std::cout << "Visual servo: locked reference BASE→marker at ["
-                      << T_base_marker_ref_.translation().x() << ", "
-                      << T_base_marker_ref_.translation().y() << ", "
-                      << T_base_marker_ref_.translation().z() << "]" << std::endl;
+
+            std::cout << "Visual servo: locked reference EE→marker." << std::endl;
             std::cout << "  Servo gain: " << params_.vs_servo_gain 
                       << ", Smoothing: " << params_.vs_smoothing 
                       << ", Deadband: " << params_.vs_position_deadband*1000 << "mm" << std::endl;
             return;
         }
 
-        // Servo law: Position EE such that marker stays at reference position in BASE frame
-        // We want: T_base_ee_target * T_ee_marker_meas = T_base_marker_ref
-        // Therefore: T_base_ee_target_raw = T_base_marker_ref * T_ee_marker_meas^(-1)
-        Eigen::Affine3d T_base_ee_target_raw = T_base_marker_ref_ * T_ee_marker_meas_.inverse();
+        // Servo law: Position EE such that EE→marker stays at reference relative pose.
+        //
+        // We want: T_base_ee_target * T_ee_marker_ref = T_base_marker_current,
+        // where T_base_marker_current = T_base_ee_current * T_ee_marker_meas.
+        //
+        // Thus: T_base_ee_target = T_base_ee_current * T_ee_marker_meas * (T_ee_marker_ref)^(-1)
+        Eigen::Affine3d T_base_ee_target_raw =
+            T_base_ee_current * T_ee_marker_meas_ * T_ee_marker_ref_.inverse();
         
         Eigen::Vector3d raw_target_pos = T_base_ee_target_raw.translation();
         Eigen::Quaterniond raw_target_quat(T_base_ee_target_raw.rotation());

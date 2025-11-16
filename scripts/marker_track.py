@@ -43,10 +43,7 @@ class MarkerTracker:
                  board_spacing: float = 0.01,  # 1cm
                  aruco_dict: str = "4x4_50",
                  camera_fps: int = 30,
-                 debug: bool = False,
-                 smoothing_factor: float = 0.85,  # Higher for 30Hz marker rate
-                 position_scale: float = 0.5,  # Scale factor for position deltas
-                 position_deadband: float = 0.002):  # 2mm deadband
+                 debug: bool = False):
         
         # Network setup
         self.robot_ip = robot_ip
@@ -60,6 +57,7 @@ class MarkerTracker:
         
         # Camera-to-end-effector transform: -90° around Z axis
         # Camera X → EE -Y, Camera Y → EE X, Camera Z → EE Z
+        # (camera and EE Z both point from sensor towards the marker / scene)
         self.direct_mapping = lambda cam: np.array([cam[1], -cam[0], cam[2]])
         self.orientation_transform_matrix = np.array([
             [0,  1,  0],  # EE X = Camera Y
@@ -67,30 +65,17 @@ class MarkerTracker:
             [0,  0,  1]   # EE Z = Camera Z
         ])
         
-        # Control parameters
-        self.smoothing_factor = smoothing_factor
-        self.position_scale = position_scale  # Gain for position control
-        self.position_deadband = position_deadband  # Deadband to prevent oscillation
-        
-        # Smoothed state
-        self.smoothed_position = np.array([0.0, 0.0, 0.0])
-        self.smoothed_orientation = np.array([0.0, 0.0, 0.0, 1.0])
-        
         # Tracking state
         self.tracking_active = False
-        self.marker_locked_pose: Optional[MarkerPose] = None  # "Zero" reference when 't' was pressed
         self.current_marker_pose: Optional[MarkerPose] = None
-        self.last_processed_marker_pose: Optional[MarkerPose] = None  # Track if we've already processed this detection
-        self.robot_base_pose = {
-            'position': np.array([0.0, 0.0, 0.0]),  # Robot base reference (identity)
-            'orientation': np.array([0.0, 0.0, 0.0, 1.0])
-        }
-        self.target_tcp_pose = {
-            'position': np.array([0.0, 0.0, 0.0]),
-            'orientation': np.array([0.0, 0.0, 0.0, 1.0])
-        }
         self.last_detection_time = 0.0
         self.detection_timeout = 0.5  # seconds
+        
+        # Pose measurement smoothing (temporal filter for camera jitter)
+        self.measurement_smoothing = 0.7  # EMA smoothing for raw pose measurements (0.0=no filter, 0.9=max)
+        self.smoothed_measurement_pos: Optional[np.ndarray] = None
+        self.smoothed_measurement_quat: Optional[np.ndarray] = None
+        self.outlier_threshold = 0.15  # 15cm - reject measurements that jump too far
         
         # ArUco dictionary mapping
         dict_map = {
@@ -105,14 +90,19 @@ class MarkerTracker:
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_enum)
         self.detector_params = cv2.aruco.DetectorParameters()
         
-        # Improve detection stability
+        # Improve detection stability with aggressive corner refinement
         self.detector_params.adaptiveThreshWinSizeMin = 3
         self.detector_params.adaptiveThreshWinSizeMax = 23
         self.detector_params.adaptiveThreshWinSizeStep = 10
         self.detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.detector_params.cornerRefinementWinSize = 5
-        self.detector_params.cornerRefinementMaxIterations = 30
-        self.detector_params.cornerRefinementMinAccuracy = 0.1
+        self.detector_params.cornerRefinementMaxIterations = 100  # Increased from 30
+        self.detector_params.cornerRefinementMinAccuracy = 0.01   # Tighter from 0.1
+        
+        # Additional detection parameters for stability
+        self.detector_params.minMarkerPerimeterRate = 0.03
+        self.detector_params.maxMarkerPerimeterRate = 4.0
+        self.detector_params.polygonalApproxAccuracyRate = 0.03
         
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.detector_params)
         
@@ -201,10 +191,10 @@ class MarkerTracker:
             print(f"Marker size: {marker_size*100:.1f}cm")
         print(f"ArUco dict: {aruco_dict}")
         print(f"Camera FPS: {camera_fps}")
-        print(f"Control parameters:")
-        print(f"  Smoothing: {smoothing_factor:.2f} (0=none, 0.95=max)")
-        print(f"  Position scale: {position_scale:.2f} (gain/sensitivity)")
-        print(f"  Position deadband: {position_deadband*1000:.1f}mm (anti-oscillation)")
+        print(f"\nMeasurement filtering (camera jitter reduction):")
+        print(f"  Temporal smoothing: {self.measurement_smoothing:.2f} (0=none, 0.9=max)")
+        print(f"  Outlier threshold: {self.outlier_threshold*1000:.0f}mm (jump rejection)")
+        print(f"  Corner refinement: {self.detector_params.cornerRefinementMaxIterations} iterations")
         print(f"\nEye-in-hand: Camera on end-effector, -90° Z rotation")
         print("  Camera Y → EE X, -Camera X → EE Y, Camera Z → EE Z")
         print("  Server transforms EE-relative poses to base frame in real-time")
@@ -291,18 +281,48 @@ class MarkerTracker:
         # Convert rotation vector to quaternion
         rotation_matrix, _ = cv2.Rodrigues(rvec)
         rotation = Rotation.from_matrix(rotation_matrix)
-        quat = rotation.as_quat()  # [qx, qy, qz, qw]
+        quat_raw = rotation.as_quat()  # [qx, qy, qz, qw]
         
         # Position in camera frame (tvec is already 1D array [x, y, z])
-        position = tvec  # [x, y, z] in meters
+        position_raw = tvec  # [x, y, z] in meters
+        
+        # Apply temporal smoothing to reduce camera jitter
+        if self.smoothed_measurement_pos is None:
+            # First detection - initialize smoothed state
+            self.smoothed_measurement_pos = position_raw.copy()
+            self.smoothed_measurement_quat = quat_raw.copy()
+            position_smoothed = position_raw
+            quat_smoothed = quat_raw
+        else:
+            # Check for outliers (sudden large jumps indicate detection error)
+            pos_diff = np.linalg.norm(position_raw - self.smoothed_measurement_pos)
+            if pos_diff > self.outlier_threshold:
+                # Outlier detected - keep previous smoothed value
+                position_smoothed = self.smoothed_measurement_pos
+                quat_smoothed = self.smoothed_measurement_quat
+            else:
+                # Apply EMA smoothing to position
+                alpha = 1.0 - self.measurement_smoothing
+                self.smoothed_measurement_pos = (self.measurement_smoothing * self.smoothed_measurement_pos + 
+                                                 alpha * position_raw)
+                position_smoothed = self.smoothed_measurement_pos
+                
+                # Apply SLERP smoothing to orientation
+                rot_prev = Rotation.from_quat(self.smoothed_measurement_quat)
+                rot_raw = Rotation.from_quat(quat_raw)
+                rot_smoothed = Rotation.from_quat([rot_prev.as_quat(), rot_raw.as_quat()])
+                slerp = Slerp([0, 1], rot_smoothed)
+                rot_filtered = slerp(alpha)
+                self.smoothed_measurement_quat = rot_filtered.as_quat()
+                quat_smoothed = self.smoothed_measurement_quat
         
         self.last_detection_time = time.time()
         
         return MarkerPose(
-            position=position,
-            orientation=quat,
-            tvec=tvec,
-            rvec=rvec,
+            position=position_smoothed,
+            orientation=quat_smoothed,
+            tvec=position_smoothed,  # Use smoothed for consistency
+            rvec=rvec,  # Keep raw rvec for visualization
             detected=True,
             num_markers=num_detected
         )
@@ -341,95 +361,21 @@ class MarkerTracker:
         cv2.line(image, origin, tuple(imgpts[3].ravel()), (255, 0, 0), 3)  # Z-axis (blue)
     
     def start_tracking(self):
-        """Lock marker pose and start tracking (differential control like VR)"""
+        """Start tracking - sends marker pose measurements to server"""
         if self.current_marker_pose is not None and self.current_marker_pose.detected:
-            # Lock the current marker pose as "zero" reference
-            self.marker_locked_pose = self.current_marker_pose
-            
-            # Initialize target to robot base (identity)
-            self.target_tcp_pose['position'] = self.robot_base_pose['position'].copy()
-            self.target_tcp_pose['orientation'] = self.robot_base_pose['orientation'].copy()
-            
             self.tracking_active = True
-            print(f"\n✓ Tracking started - marker locked as reference!")
-            print(f"  Marker will move robot differentially (like VR controller)")
+            print(f"\n✓ Tracking started!")
+            print(f"  Server will lock reference and compute visual servo")
         else:
             print("\n✗ Cannot start tracking - no marker detected!")
-    
-    def compute_visual_servoing_command(self):
-        """
-        Differential control: marker motion = TCP motion (like VR controller).
-        Applies smoothing exactly like vr_to_robot_converter.py
-        
-        IMPORTANT: Only update smoothing when we get NEW marker detection (camera ~30Hz),
-        but send commands at 100Hz (repeat last smoothed command until new detection).
-        """
-        if not self.tracking_active or self.marker_locked_pose is None or self.current_marker_pose is None:
-            return
-        
-        # Check if this is a new detection (only smooth on new data!)
-        # Compare by identity - if it's the same object, we've already processed it
-        if self.current_marker_pose is self.last_processed_marker_pose:
-            # No new detection - just keep sending the last smoothed command (already in target_tcp_pose)
-            return
-        
-        # Mark this detection as processed
-        self.last_processed_marker_pose = self.current_marker_pose
-        
-        # Calculate marker pose delta from locked pose IN CAMERA FRAME
-        marker_pos_delta_cam = self.current_marker_pose.position - self.marker_locked_pose.position
-        
-        # Transform delta to robot frame using configured mapping
-        marker_pos_delta_robot = self.direct_mapping(marker_pos_delta_cam)
-        
-        # Apply position scale (gain) to delta
-        scaled_delta = marker_pos_delta_robot * self.position_scale
-        
-        # Apply deadband per-axis to prevent micro-oscillations
-        for i in range(3):
-            if abs(scaled_delta[i]) < self.position_deadband:
-                scaled_delta[i] = 0.0
-        
-        # Apply smoothing to position delta (EMA filter) IN ROBOT FRAME
-        self.smoothed_position = (self.smoothing_factor * self.smoothed_position + 
-                                  (1 - self.smoothing_factor) * scaled_delta)
-        
-        # Calculate relative rotation IN CAMERA FRAME
-        locked_rot_cam = Rotation.from_quat(self.marker_locked_pose.orientation)
-        current_rot_cam = Rotation.from_quat(self.current_marker_pose.orientation)
-        relative_rot_cam = current_rot_cam * locked_rot_cam.inv()
-        
-        # Transform relative rotation to robot frame using matrix transform
-        # R_robot = T @ R_camera @ T^T (where T is the coordinate transform matrix)
-        relative_matrix_cam = relative_rot_cam.as_matrix()
-        relative_matrix_robot = self.orientation_transform_matrix @ relative_matrix_cam @ self.orientation_transform_matrix.T
-        relative_rot_robot = Rotation.from_matrix(relative_matrix_robot)
-        
-        # Apply relative rotation to base orientation to get target orientation
-        base_rot = Rotation.from_quat(self.robot_base_pose['orientation'])
-        target_rot = relative_rot_robot * base_rot  # Unsmoothed target
-        
-        # Apply smoothing to TARGET orientation using Slerp (spherical linear interpolation)
-        # This matches VR code: smooth the target, not the delta
-        slerp_t = 1 - self.smoothing_factor
-        current_smoothed_rot = Rotation.from_quat(self.smoothed_orientation)
-        key_rotations = Rotation.from_quat([current_smoothed_rot.as_quat(), target_rot.as_quat()])
-        slerp = Slerp([0, 1], key_rotations)
-        smoothed_target_rot = slerp(slerp_t)
-        self.smoothed_orientation = smoothed_target_rot.as_quat()
-        
-        # Normalize quaternion to ensure it remains a unit quaternion
-        self.smoothed_orientation = self.smoothed_orientation / np.linalg.norm(self.smoothed_orientation)
-        
-        # Update target TCP pose with smoothed values
-        self.target_tcp_pose['position'] = self.robot_base_pose['position'] + self.smoothed_position
-        self.target_tcp_pose['orientation'] = self.smoothed_orientation
     
     def stop_tracking(self, reason: str = "User stopped"):
         """Stop tracking"""
         if self.tracking_active:
             self.tracking_active = False
-            self.marker_locked_pose = None
+            # Reset measurement smoothing filter for next tracking session
+            self.smoothed_measurement_pos = None
+            self.smoothed_measurement_quat = None
             print(f"\n✗ Tracking stopped: {reason}")
     
     def send_robot_command(self, position: np.ndarray, orientation: np.ndarray):
@@ -456,15 +402,7 @@ class MarkerTracker:
                     print(f"  Marker in EE Frame (sent to server):")
                     print(f"    Position: X:{position[0]:+.3f} Y:{position[1]:+.3f} Z:{position[2]:+.3f}m")
                     print(f"    Quat:     x:{orientation[0]:+.3f} y:{orientation[1]:+.3f} z:{orientation[2]:+.3f} w:{orientation[3]:+.3f}")
-                    if self.marker_locked_pose and self.current_marker_pose:
-                        delta_cam = self.current_marker_pose.position - self.marker_locked_pose.position
-                        delta_ee = self.direct_mapping(delta_cam)
-                        scaled_delta = delta_ee * self.position_scale
-                        print(f"  Marker Delta (Camera): X:{delta_cam[0]:+.3f} Y:{delta_cam[1]:+.3f} Z:{delta_cam[2]:+.3f}m")
-                        print(f"  Marker Delta (EE):     X:{delta_ee[0]:+.3f} Y:{delta_ee[1]:+.3f} Z:{delta_ee[2]:+.3f}m")
-                        print(f"  Scaled Delta (x{self.position_scale:.2f}): X:{scaled_delta[0]:+.3f} Y:{scaled_delta[1]:+.3f} Z:{scaled_delta[2]:+.3f}m")
-                        print(f"  Smoothed Delta (EE):   X:{self.smoothed_position[0]:+.3f} Y:{self.smoothed_position[1]:+.3f} Z:{self.smoothed_position[2]:+.3f}m")
-                    print(f"  (Server transforms EE→Base using real-time robot state)")
+                    print(f"  (Server performs visual servo control with gain/smoothing/deadband)")
                     self.command_send_count = 0
                     self.last_command_log_time = current_time
         except Exception as e:
@@ -495,107 +433,65 @@ class MarkerTracker:
                 self.stop_tracking("Marker lost")
     
     def render_debug_window(self):
-        """Render debug visualization of command frame"""
-        if not self.debug or not self.tracking_active:
+        """Render debug visualization of marker measurement"""
+        if not self.debug or not self.tracking_active or not self.current_marker_pose:
             return
         
-        # Create a 3D visualization canvas
-        canvas_size = 600
+        # Create a simple info canvas
+        canvas_size = 400
         canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.uint8) * 40
         
         # Draw title
-        cv2.putText(canvas, "EE-Relative Command (Debug)", (10, 30),
+        cv2.putText(canvas, "Marker Measurement (Debug)", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # Draw coordinate system in center
-        center = (canvas_size // 2, canvas_size // 2)
-        scale = 100  # pixels per meter
+        # Transform current marker to EE frame
+        pos_ee, quat_ee = self.transform_camera_to_ee(
+            self.current_marker_pose.position,
+            self.current_marker_pose.orientation
+        )
         
-        # Draw base frame (gray)
-        base_x_end = (int(center[0] + scale * 0.5), center[1])
-        base_y_end = (center[0], int(center[1] - scale * 0.5))
-        cv2.line(canvas, center, base_x_end, (100, 100, 100), 2)
-        cv2.line(canvas, center, base_y_end, (100, 100, 100), 2)
-        cv2.putText(canvas, "Base", (center[0] + 10, center[1] + 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+        # Show measurements
+        info_y = 80
+        cv2.putText(canvas, "Current Marker Pose:", (10, info_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         
-        # Draw target TCP frame (colored)
-        if self.target_tcp_pose is not None:
-            pos = self.target_tcp_pose['position']
-            quat = self.target_tcp_pose['orientation']
-            
-            # Convert position to canvas coordinates
-            tcp_x = int(center[0] + pos[0] * scale)
-            tcp_y = int(center[1] - pos[2] * scale)  # Flip Y for display
-            
-            # Draw target position
-            cv2.circle(canvas, (tcp_x, tcp_y), 5, (0, 255, 255), -1)
-            
-            # Draw target orientation as arrows
-            rot = Rotation.from_quat(quat)
-            # X-axis (red)
-            x_dir = rot.apply([0.3, 0, 0])
-            x_end = (int(tcp_x + x_dir[0] * scale), int(tcp_y - x_dir[2] * scale))
-            cv2.arrowedLine(canvas, (tcp_x, tcp_y), x_end, (0, 0, 255), 2, tipLength=0.3)
-            
-            # Y-axis (green)
-            y_dir = rot.apply([0, 0.3, 0])
-            y_end = (int(tcp_x + y_dir[0] * scale), int(tcp_y - y_dir[2] * scale))
-            cv2.arrowedLine(canvas, (tcp_x, tcp_y), y_end, (0, 255, 0), 2, tipLength=0.3)
-            
-            # Z-axis (blue)
-            z_dir = rot.apply([0, 0, 0.3])
-            z_end = (int(tcp_x + z_dir[0] * scale), int(tcp_y - z_dir[2] * scale))
-            cv2.arrowedLine(canvas, (tcp_x, tcp_y), z_end, (255, 0, 0), 2, tipLength=0.3)
-            
-            # Show numerical values
-            info_y = 80
-            cv2.putText(canvas, f"Target TCP Pose:", (10, info_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(canvas, f"  Position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]m", 
-                       (10, info_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            cv2.putText(canvas, f"  Quat: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]",
-                       (10, info_y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            
-            # Show marker delta if available
-            if self.marker_locked_pose and self.current_marker_pose:
-                # Camera frame delta
-                delta_pos_cam = self.current_marker_pose.position - self.marker_locked_pose.position
-                cv2.putText(canvas, f"Marker Delta (Camera Frame):", (10, info_y + 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 200, 255), 1)
-                cv2.putText(canvas, f"  X:{delta_pos_cam[0]:+.3f} Y:{delta_pos_cam[1]:+.3f} Z:{delta_pos_cam[2]:+.3f}m",
-                           (10, info_y + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 200, 255), 1)
-                
-                # EE frame delta (transformed from camera)
-                delta_pos_ee = self.direct_mapping(delta_pos_cam)
-                cv2.putText(canvas, f"EE Delta (raw):", (10, info_y + 145),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
-                cv2.putText(canvas, f"  X:{delta_pos_ee[0]:+.3f} Y:{delta_pos_ee[1]:+.3f} Z:{delta_pos_ee[2]:+.3f}m",
-                           (10, info_y + 170), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 100), 1)
-                
-                # Scaled delta
-                scaled_delta = delta_pos_ee * self.position_scale
-                cv2.putText(canvas, f"Scaled Delta (x{self.position_scale:.2f}):", (10, info_y + 200),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 150, 50), 1)
-                cv2.putText(canvas, f"  X:{scaled_delta[0]:+.3f} Y:{scaled_delta[1]:+.3f} Z:{scaled_delta[2]:+.3f}m",
-                           (10, info_y + 225), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 150, 50), 1)
-                
-                # Smoothed output (in EE frame, sent to server)
-                cv2.putText(canvas, f"Smoothed EE Delta (sent):", (10, info_y + 255),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.putText(canvas, f"  X:{self.smoothed_position[0]:+.3f} Y:{self.smoothed_position[1]:+.3f} Z:{self.smoothed_position[2]:+.3f}m",
-                           (10, info_y + 280), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                
-                cv2.putText(canvas, f"Settings: scale={self.position_scale:.2f} smooth={self.smoothing_factor:.2f} db={self.position_deadband*1000:.1f}mm",
-                           (10, info_y + 315), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-                cv2.putText(canvas, f"Cam→EE: -90deg Z | Server: EE→Base (real-time)",
-                           (10, info_y + 340), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+        cv2.putText(canvas, "Camera Frame:", (10, info_y + 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 200, 255), 1)
+        cv2.putText(canvas, f"  Pos: X:{self.current_marker_pose.position[0]:+.3f} "
+                           f"Y:{self.current_marker_pose.position[1]:+.3f} "
+                           f"Z:{self.current_marker_pose.position[2]:+.3f}m",
+                   (10, info_y + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 200, 255), 1)
+        
+        cv2.putText(canvas, "EE Frame (sent to server):", (10, info_y + 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(canvas, f"  Pos: X:{pos_ee[0]:+.3f} Y:{pos_ee[1]:+.3f} Z:{pos_ee[2]:+.3f}m",
+                   (10, info_y + 125), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.putText(canvas, f"  Quat: x:{quat_ee[0]:+.2f} y:{quat_ee[1]:+.2f} "
+                           f"z:{quat_ee[2]:+.2f} w:{quat_ee[3]:+.2f}",
+                   (10, info_y + 150), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        cv2.putText(canvas, "Measurement Filtering:", (10, info_y + 190),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(canvas, f"  Temporal smoothing: {self.measurement_smoothing:.2f}",
+                   (10, info_y + 215), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(canvas, f"  Outlier threshold: {self.outlier_threshold*1000:.0f}mm",
+                   (10, info_y + 240), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        
+        cv2.putText(canvas, "Server performs visual servo control:", (10, info_y + 280),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 255), 1)
+        cv2.putText(canvas, "  - Locks marker ref on first frame", (10, info_y + 305),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+        cv2.putText(canvas, "  - Computes EE target to restore ref", (10, info_y + 325),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+        cv2.putText(canvas, "  - Applies gain/smoothing/deadband", (10, info_y + 345),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
         
         # Show warning
         cv2.putText(canvas, "[DEBUG MODE - Commands NOT sent to robot]", 
-                   (10, canvas_size - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                   (10, canvas_size - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 2)
         
-        cv2.imshow('Debug: TCP Command Frame', canvas)
+        cv2.imshow('Debug: Marker Measurement', canvas)
     
     def render_gui(self, color_image: np.ndarray) -> np.ndarray:
         """Render GUI with overlays"""
@@ -899,14 +795,6 @@ Examples:
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug mode (visualize commands, do NOT send to robot)')
     
-    # Control parameters
-    parser.add_argument('--smoothing', type=float, default=0.85,
-                       help='Smoothing factor (0.0=no smoothing, 0.95=max, default: 0.85 for 30Hz)')
-    parser.add_argument('--position-scale', type=float, default=0.5,
-                       help='Position gain/scale factor (0.1-2.0, default: 0.5)')
-    parser.add_argument('--position-deadband', type=float, default=0.002,
-                       help='Position deadband in meters (default: 0.002 = 2mm)')
-    
     args = parser.parse_args()
     
     # Auto-detect YAML config if not provided
@@ -974,10 +862,7 @@ Examples:
             board_spacing=board_spacing if use_board else 0.01,
             aruco_dict=aruco_dict,
             camera_fps=args.fps,
-            debug=args.debug,
-            smoothing_factor=args.smoothing,
-            position_scale=args.position_scale,
-            position_deadband=args.position_deadband
+            debug=args.debug
         )
         
         if args.debug:

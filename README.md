@@ -1,57 +1,39 @@
 # geoik-velctrl
 
-A geometric IK-based velocity control server for the Franka Emika robot.
+Geometric IK-based velocity control with eye-in-hand visual servoing for Franka Emika robots. Track ArUco markers in real-time and maintain desired end-effector-to-marker poses.
 
 ![Demo](data/media/demo.gif)
 
-## Overview
-
-This standalone server receives end-effector pose commands via UDP and controls the Franka robot using:
-- **Geometric IK** (GeoFIK algorithm) for analytical inverse kinematics
-- **Weighted optimization** for manipulability, joint limits, and base stability
-- **Ruckig trajectory generation** for smooth, jerk-limited motion profiles
-- **Joint-space velocity control** at 1kHz via libfranka
-
 ## Quick Start
 
-### Prerequisites
+### 1. Install and Run C++ Velocity Server
 
-- **libfranka** (matching your robot firmware version)
-- **Eigen3**: `sudo apt install libeigen3-dev`
-- **Ruckig**: `sudo apt install libruckig-dev`
-
-### Build
+Using [servobox](https://www.servobox.dev):
 
 ```bash
-mkdir build && cd build
-cmake -DFRANKA_INSTALL_PATH=/path/to/libfranka/install ..
-make -j4
+servobox pkg-install geoik-velctrl
+servobox run geoik-velctrl <robot-ip> false vs
 ```
 
-### Run
+Arguments: `<robot-ip>` `<bidexhand: true/false>` `<mode: vs for visual servo, vr for VR>`
+
+### 2. Install Python Marker Tracking
+
+Create environment with micromamba (or conda/mamba):
 
 ```bash
-./franka_velocity_server <robot-hostname> [bidexhand]
+micromamba create -n marker-track python=3.10
+micromamba activate marker-track
+pip install -r requirements.txt
 ```
 
-Arguments:
-- `<robot-hostname>`: IP address or hostname of your Franka robot
-- `[bidexhand]`: Optional. Set to `true` to limit J7 range (default: `false`)
+### 3. Run Marker Tracker
 
-The server listens on **UDP port 8888** for pose commands in the format:
-
-```
-x y z qx qy qz qw
+```bash
+python3 scripts/marker_track.py --config markers/board_4x4_4x4_50.yaml
 ```
 
-Where:
-- `x y z`: Position in meters (robot base frame)
-- `qx qy qz qw`: Orientation quaternion
-
-Example:
-```
-0.3 0.0 0.5 0.0 0.0 0.0 1.0
-```
+Press `t` to start/stop tracking. The robot maintains the locked end-effector-to-marker pose as you move the marker.
 
 ## Attribution
 

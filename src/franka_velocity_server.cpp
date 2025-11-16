@@ -53,11 +53,11 @@ private:
         double max_position_offset = 0.75;   // 75cm from initial position
         
         // Visual servoing specific parameters
-        double vs_position_gain = 0.7;           // Position gain (0.1-1.0, how fast to follow position)
+        double vs_position_gain = 0.65;           // Position gain (0.1-1.0, how fast to follow position)
         double vs_orientation_gain = 0.7;        // Orientation gain (0.01-0.5, how fast to follow rotation)
         double vs_smoothing = 0.65;              // EMA smoothing for VS target (0.0-0.95, higher = smoother)
-        double vs_position_deadband = 0.001;     // 2mm position deadband (ignore small position errors)
-        double vs_orientation_deadband = 0.01;   // ~1.15° orientation deadband (ignore small rotation errors)
+        double vs_position_deadband = 0.0015;     // 2mm position deadband (ignore small position errors)
+        double vs_orientation_deadband = 0.015;   // ~1.15° orientation deadband (ignore small rotation errors)
     } params_;
 
     // Target Pose (in robot base frame)

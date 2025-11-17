@@ -74,15 +74,4 @@ BibTeX:
 }
 ```
 
-### Your Project
-
-You may choose an overall license for your own standalone velocity server
-(for example, MIT or Apache-2.0). Whatever you choose, you must:
-
-- Keep the existing copyright and license headers.
-- Ship `LICENSE-APACHE-2.0` and `LICENSE-FRANKA-VR-TELEOP` alongside your
-  binaries or source distributions.
-- Keep this `ATTRIBUTION.md` (or an equivalent NOTICE/ATTRIBUTION file) so
-  that upstream work is clearly credited.
-
 

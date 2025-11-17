@@ -135,24 +135,26 @@ class MarkerTracker:
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         
-        # Enable color stream only (max resolution for better detection)
-        resolution_attempts = [
-            (1280, 800, "1280x800")
-        ]
+        # Map FPS to resolution (RealSense D435 constraints)
+        fps_to_resolution = {
+            30: (1280, 800),
+            60: (848, 480),
+            90: (640, 360)
+        }
         
-        profile = None
-        for width, height, name in resolution_attempts:
-            try:
-                self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, camera_fps)
-                profile = self.pipeline.start(self.config)
-                print(f"✓ Using {name} resolution")
-                break
-            except RuntimeError:
-                self.config = rs.config()  # Reset config for next attempt
-                continue
+        if camera_fps not in fps_to_resolution:
+            raise ValueError(f"Invalid FPS {camera_fps}. Must be 30, 60, or 90.")
         
-        if profile is None:
-            raise RuntimeError("Failed to start RealSense camera with any supported resolution")
+        width, height = fps_to_resolution[camera_fps]
+        
+        # Enable color stream with resolution matching FPS
+        try:
+            self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, camera_fps)
+            profile = self.pipeline.start(self.config)
+            print(f"✓ Using {width}x{height} @ {camera_fps} FPS")
+        except RuntimeError as e:
+            self.config = rs.config()  # Reset config for next attempt
+            raise RuntimeError(f"Failed to start RealSense camera with {width}x{height} @ {camera_fps} FPS: {e}")
         
         # Get camera intrinsics
         color_profile = profile.get_stream(rs.stream.color)
@@ -788,8 +790,8 @@ Examples:
                        help='ArUco dictionary (default: 4x4_50)')
     
     # Camera parameters
-    parser.add_argument('--fps', type=int, default=30,
-                       help='Camera FPS (default: 30)')
+    parser.add_argument('--fps', type=int, default=30, choices=[30, 60, 90],
+                       help='Camera FPS (default: 30). 30fps=1280x800, 60fps=848x480, 90fps=640x360')
     
     # Debug mode
     parser.add_argument('--debug', action='store_true',

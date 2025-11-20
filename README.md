@@ -12,7 +12,7 @@ Using [servobox](https://www.servobox.dev):
 
 ```bash
 servobox pkg-install geoik-velctrl
-servobox run geoik-velctrl <robot-ip> false vs
+servobox run geoik-velctrl
 ```
 
 ### 2. Install Python Marker Tracking
